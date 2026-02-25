@@ -897,7 +897,8 @@ def main():
     print(f"[DEBUG] Token length: {len(token)}")
     print(f"[DEBUG] Token starts with: {token[:5]}...")
     print(f"[DEBUG] Token ends with: ...{token[-5:]}")
-    print(f"[DEBUG] Token has quotes: {token.startswith(('\"', \"'\"))}")
+    has_quotes = token.startswith('"') or token.startswith("'")
+    print(f"[DEBUG] Token has quotes: {has_quotes}")
     print(f"[DEBUG] Token has newlines: {chr(10) in token or chr(13) in token}")
     print(f"[DEBUG] Source: environment variable" if os.environ.get("DISCORD_TOKEN") else "[DEBUG] Source: .env file")
 
