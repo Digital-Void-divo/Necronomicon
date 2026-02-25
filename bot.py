@@ -877,14 +877,14 @@ async def on_ready():
 # === Entry Point ===
 
 def main():
-    token = os.environ.get("DISCORD_TOKEN")
+    token = os.environ.get("DISCORD_TOKEN", "").strip()
     if not token:
         env_path = os.path.join(os.path.dirname(__file__), ".env")
         if os.path.exists(env_path):
             with open(env_path) as f:
                 for line in f:
                     if line.startswith("DISCORD_TOKEN="):
-                        token = line.strip().split("=", 1)[1].strip('"\'')
+                        token = line.strip().split("=", 1)[1].strip('"\'').strip()
                         break
 
     if not token:
@@ -892,6 +892,14 @@ def main():
         print("Set it as an environment variable or create a .env file with:")
         print('DISCORD_TOKEN=your_token_here')
         return
+
+    # Debug: show token info to diagnose auth issues (remove after confirmed working)
+    print(f"[DEBUG] Token length: {len(token)}")
+    print(f"[DEBUG] Token starts with: {token[:5]}...")
+    print(f"[DEBUG] Token ends with: ...{token[-5:]}")
+    print(f"[DEBUG] Token has quotes: {token.startswith(('\"', \"'\"))}")
+    print(f"[DEBUG] Token has newlines: {chr(10) in token or chr(13) in token}")
+    print(f"[DEBUG] Source: environment variable" if os.environ.get("DISCORD_TOKEN") else "[DEBUG] Source: .env file")
 
     bot.run(token)
 
