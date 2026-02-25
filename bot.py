@@ -2,6 +2,11 @@
 
 Main entry point. Handles slash commands, button interactions,
 game session management, and ties everything together.
+
+Games are tracked per-user (not per-channel), so multiple games
+can run simultaneously in the same channel. Each game is a single
+message that gets edited in place with updated board images and buttons.
+Each player can only have one active game at a time.
 """
 
 import os
@@ -36,23 +41,23 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 compositor = ImageCompositor()
 
-# Active games: channel_id -> GameSession
-active_games: dict[int, "GameSession"] = {}
+# Active games: user_id (str) -> GameSession
+# Both players in a multiplayer game point to the SAME session
+active_games: dict[str, "GameSession"] = {}
 
-# Multiplayer lobbies: channel_id -> LobbyInfo
+# Multiplayer lobbies: host_user_id (int) -> LobbyInfo
 active_lobbies: dict[int, "LobbyInfo"] = {}
 
 
 class LobbyInfo:
-    def __init__(self, host_id: int, host_name: str, channel_id: int, message: discord.Message = None):
+    def __init__(self, host_id: int, host_name: str, channel_id: int):
         self.host_id = host_id
         self.host_name = host_name
         self.channel_id = channel_id
-        self.message = message
 
 
 class GameSession:
-    """Tracks a game session in a Discord channel."""
+    """Tracks a game session tied to one or two users."""
 
     def __init__(self, game_state: GameState, engine: GameEngine,
                  channel_id: int, bot_ai: BotAI = None,
@@ -63,17 +68,45 @@ class GameSession:
         self.bot_ai = bot_ai
         self.is_campaign = is_campaign
         self.is_multiplayer = is_multiplayer
-        self.message: Optional[discord.Message] = None  # The board message we update
+        self.message: Optional[discord.Message] = None  # The single game message we edit
         self.p1_avatar_bytes: bytes = None
         self.p2_avatar_bytes: bytes = None
         self.awaiting_blackmail: bool = False
         self.blackmail_target_id: str = None
+        self.lock = asyncio.Lock()  # Prevent concurrent edits
+
+    @property
+    def player_ids(self) -> list[str]:
+        """Return list of human player user IDs in this session."""
+        ids = []
+        if not self.game_state.player1.is_bot:
+            ids.append(self.game_state.player1.user_id)
+        if not self.game_state.player2.is_bot:
+            ids.append(self.game_state.player2.user_id)
+        return ids
 
 
 # === Helper Functions ===
 
+def get_session_for_user(user_id: str) -> Optional[GameSession]:
+    return active_games.get(user_id)
+
+
+def user_in_game(user_id: str) -> bool:
+    return user_id in active_games
+
+
+def register_session(session: GameSession):
+    for uid in session.player_ids:
+        active_games[uid] = session
+
+
+def unregister_session(session: GameSession):
+    for uid in session.player_ids:
+        active_games.pop(uid, None)
+
+
 async def get_avatar_bytes(user: discord.User) -> bytes:
-    """Download a user's avatar as bytes."""
     try:
         if user.avatar:
             return await user.avatar.read()
@@ -83,7 +116,6 @@ async def get_avatar_bytes(user: discord.User) -> bytes:
 
 
 def build_player_from_user(user: discord.User, player_data: dict) -> Player:
-    """Create a Player instance from a Discord user and saved data."""
     return Player(
         user_id=str(user.id),
         display_name=user.display_name,
@@ -94,7 +126,6 @@ def build_player_from_user(user: discord.User, player_data: dict) -> Player:
 
 
 def build_bot_player(enemy: CampaignEnemy) -> Player:
-    """Create a bot Player from a campaign enemy definition."""
     p = Player(
         user_id=f"bot_{enemy.name}",
         display_name=enemy.name,
@@ -102,13 +133,10 @@ def build_bot_player(enemy: CampaignEnemy) -> Player:
         is_bot=True
     )
     p.override_starting_stats(
-        life=enemy.life,
-        sanity=enemy.sanity,
-        taint=enemy.taint,
-        arcane=enemy.arcane,
+        life=enemy.life, sanity=enemy.sanity,
+        taint=enemy.taint, arcane=enemy.arcane,
         elder_defense=enemy.elder_defense
     )
-    # Build deck from specified cards
     if enemy.card_ids:
         cards = [CARDS_BY_ID[cid] for cid in enemy.card_ids if cid in CARDS_BY_ID]
         p.build_deck_from_list(cards)
@@ -118,10 +146,9 @@ def build_bot_player(enemy: CampaignEnemy) -> Player:
     return p
 
 
-def render_board_image(session: GameSession, resolving_card_id: str = None,
-                       resolving_player_is_bottom: bool = True,
-                       book_open: bool = False) -> discord.File:
-    """Render the board and return as a discord.File."""
+def render_board_file(session: GameSession, resolving_card_id: str = None,
+                      resolving_player_is_bottom: bool = True,
+                      book_open: bool = False) -> discord.File:
     img_bytes = compositor.render_board(
         session.game_state,
         resolving_card_id=resolving_card_id,
@@ -133,17 +160,37 @@ def render_board_image(session: GameSession, resolving_card_id: str = None,
     return discord.File(io.BytesIO(img_bytes), filename="board.png")
 
 
-def build_game_buttons(session: GameSession) -> discord.ui.View:
-    """Build the button UI for the current game state."""
-    view = GameView(session)
-    return view
+async def update_game_message(session: GameSession, content: str,
+                              file: discord.File = None,
+                              view: discord.ui.View = None):
+    """Edit the game message in place. Falls back to sending new if needed."""
+    try:
+        if session.message:
+            if file:
+                await session.message.edit(content=content, attachments=[file], view=view)
+            else:
+                await session.message.edit(content=content, view=view)
+        else:
+            channel = bot.get_channel(session.channel_id)
+            if channel:
+                kwargs = {"content": content, "view": view}
+                if file:
+                    kwargs["file"] = file
+                session.message = await channel.send(**kwargs)
+    except discord.NotFound:
+        channel = bot.get_channel(session.channel_id)
+        if channel:
+            kwargs = {"content": content, "view": view}
+            if file:
+                kwargs["file"] = file
+            session.message = await channel.send(**kwargs)
+    except discord.HTTPException as e:
+        print(f"Error updating game message: {e}")
 
 
 # === Discord UI Views ===
 
 class MainMenuView(discord.ui.View):
-    """Main menu buttons."""
-
     def __init__(self):
         super().__init__(timeout=120)
 
@@ -166,28 +213,22 @@ class MainMenuView(discord.ui.View):
 
 
 class GameView(discord.ui.View):
-    """In-game action buttons."""
-
     def __init__(self, session: GameSession):
-        super().__init__(timeout=300)
+        super().__init__(timeout=600)
         self.session = session
         gs = session.game_state
-
-        # Only show buttons for human player whose turn it is
         current = gs.current_player
+
         if current.is_bot:
             return
 
-        # View Hand button (always available)
         self.add_item(ViewHandButton(session))
 
-        # Card play/discard buttons
         for i in range(len(current.hand)):
             can_play, _ = current.can_play_card(i)
             card = current.hand[i]
             self.add_item(PlayCardButton(session, i, card.name, can_play))
 
-        # Discard button
         self.add_item(DiscardSelectButton(session))
 
 
@@ -198,8 +239,8 @@ class ViewHandButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         gs = self.session.game_state
-        # Determine which player is viewing
         user_id = str(interaction.user.id)
+
         if user_id == gs.player1.user_id:
             player = gs.player1
         elif user_id == gs.player2.user_id:
@@ -211,7 +252,6 @@ class ViewHandButton(discord.ui.Button):
         hand_bytes = compositor.render_hand(player)
         file = discord.File(io.BytesIO(hand_bytes), filename="hand.png")
 
-        # Build card info text
         lines = []
         for i, card in enumerate(player.hand):
             cost_str = f"San: {card.sanity_cost}"
@@ -243,12 +283,17 @@ class PlayCardButton(discord.ui.Button):
 
 class DiscardSelectButton(discord.ui.Button):
     def __init__(self, session: GameSession):
-        super().__init__(label="Discard a Card", style=discord.ButtonStyle.danger, emoji="🗑️",
-                         row=3)
+        super().__init__(label="Discard a Card", style=discord.ButtonStyle.danger, emoji="🗑️", row=3)
         self.session = session
 
     async def callback(self, interaction: discord.Interaction):
-        # Show a dropdown to select which card to discard
+        gs = self.session.game_state
+        user_id = str(interaction.user.id)
+
+        if gs.current_player.user_id != user_id:
+            await interaction.response.send_message("It's not your turn!", ephemeral=True)
+            return
+
         view = DiscardChoiceView(self.session)
         await interaction.response.send_message("Select a card to discard:", view=view, ephemeral=True)
 
@@ -279,7 +324,6 @@ class DiscardSelect(discord.ui.Select):
 
 
 class BlackmailChoiceView(discord.ui.View):
-    """View for the opponent to choose which card to discard from Blackmail."""
     def __init__(self, session: GameSession, target_player: Player):
         super().__init__(timeout=60)
         self.session = session
@@ -298,430 +342,31 @@ class BlackmailSelect(discord.ui.Select):
         self.session = session
 
     async def callback(self, interaction: discord.Interaction):
-        idx = int(self.values[0])
-        result = self.session.engine.resolve_blackmail_choice(idx)
-        self.session.awaiting_blackmail = False
-        self.session.blackmail_target_id = None
+        async with self.session.lock:
+            idx = int(self.values[0])
+            result = self.session.engine.resolve_blackmail_choice(idx)
+            self.session.awaiting_blackmail = False
+            self.session.blackmail_target_id = None
 
-        channel = interaction.channel
-        await interaction.response.send_message(
-            f"You discarded a card.", ephemeral=True)
-
-        await post_turn_result(channel, self.session, result)
+            await interaction.response.send_message("You discarded a card.", ephemeral=True)
+            await post_turn_result(self.session, result)
 
 
 class MultiplayerLobbyView(discord.ui.View):
-    """Lobby waiting for a challenger."""
-    def __init__(self, host_id: int, channel_id: int):
+    def __init__(self, host_id: int):
         super().__init__(timeout=300)
         self.host_id = host_id
-        self.channel_id = channel_id
 
     @discord.ui.button(label="Join Game", style=discord.ButtonStyle.success, emoji="⚔️")
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id == self.host_id:
             await interaction.response.send_message("You can't challenge yourself!", ephemeral=True)
             return
-        await start_multiplayer_game(interaction, self.channel_id)
-
-
-# === Game Flow Functions ===
-
-async def start_campaign(interaction: discord.Interaction):
-    """Start a campaign game for the user."""
-    channel_id = interaction.channel_id
-
-    if channel_id in active_games:
-        await interaction.response.send_message(
-            "A game is already in progress in this channel!", ephemeral=True)
-        return
-
-    user = interaction.user
-    player_data = load_player_data(str(user.id))
-    stage = player_data["campaign_stage"]
-
-    # Get campaign enemy
-    enemy_def = get_campaign_enemy(stage)
-
-    # Build players
-    human = build_player_from_user(user, player_data)
-    human.build_deck(get_cards_for_rank(player_data["rank"]))
-    human.draw_initial_hand()
-
-    bot_player = build_bot_player(enemy_def)
-
-    # Create game state (human = bottom/player1, bot = top/player2)
-    game_state = GameState(human, bot_player)
-    game_state.game_id = str(uuid.uuid4())
-    engine = GameEngine(game_state)
-
-    # Bot AI
-    difficulty = BotAI.get_difficulty_for_rank(enemy_def.rank)
-    bot_ai = BotAI(difficulty)
-
-    # Create session
-    session = GameSession(
-        game_state=game_state,
-        engine=engine,
-        channel_id=channel_id,
-        bot_ai=bot_ai,
-        is_campaign=True
-    )
-
-    # Get avatars
-    session.p1_avatar_bytes = await get_avatar_bytes(user)
-
-    active_games[channel_id] = session
-
-    # Respond with initial board
-    await interaction.response.defer()
-
-    board_file = render_board_image(session)
-    view = build_game_buttons(session)
-
-    stage_text = f"**Campaign Stage {stage + 1}/{get_total_campaign_stages()}**"
-    enemy_text = f"**VS {enemy_def.name}** (Rank {enemy_def.rank} - Life: {enemy_def.life})"
-
-    msg = await interaction.followup.send(
-        f"📖 {stage_text}\n{enemy_text}\n\n{user.display_name}'s turn!",
-        file=board_file, view=view)
-    session.message = msg
-
-
-async def create_multiplayer_lobby(interaction: discord.Interaction):
-    """Create a multiplayer lobby."""
-    channel_id = interaction.channel_id
-
-    if channel_id in active_games:
-        await interaction.response.send_message(
-            "A game is already in progress in this channel!", ephemeral=True)
-        return
-
-    if channel_id in active_lobbies:
-        await interaction.response.send_message(
-            "A lobby already exists in this channel!", ephemeral=True)
-        return
-
-    user = interaction.user
-    lobby = LobbyInfo(user.id, user.display_name, channel_id)
-    active_lobbies[channel_id] = lobby
-
-    view = MultiplayerLobbyView(user.id, channel_id)
-    await interaction.response.send_message(
-        f"⚔️ **{user.display_name}** is looking for a challenger!\nClick **Join Game** to accept.",
-        view=view)
-
-
-async def start_multiplayer_game(interaction: discord.Interaction, channel_id: int):
-    """Start a multiplayer game when someone joins the lobby."""
-    if channel_id not in active_lobbies:
-        await interaction.response.send_message("Lobby no longer exists!", ephemeral=True)
-        return
-
-    lobby = active_lobbies.pop(channel_id)
-    host = await bot.fetch_user(lobby.host_id)
-    challenger = interaction.user
-
-    host_data = load_player_data(str(host.id))
-    challenger_data = load_player_data(str(challenger.id))
-
-    # Host = bottom (player1), Challenger = top (player2)
-    p1 = build_player_from_user(host, host_data)
-    p1.build_deck(get_cards_for_rank(host_data["rank"]))
-    p1.draw_initial_hand()
-
-    p2 = build_player_from_user(challenger, challenger_data)
-    p2.build_deck(get_cards_for_rank(challenger_data["rank"]))
-    p2.draw_initial_hand()
-
-    game_state = GameState(p1, p2)
-    game_state.game_id = str(uuid.uuid4())
-    engine = GameEngine(game_state)
-
-    session = GameSession(
-        game_state=game_state,
-        engine=engine,
-        channel_id=channel_id,
-        is_multiplayer=True
-    )
-
-    session.p1_avatar_bytes = await get_avatar_bytes(host)
-    session.p2_avatar_bytes = await get_avatar_bytes(challenger)
-
-    active_games[channel_id] = session
-
-    await interaction.response.defer()
-
-    board_file = render_board_image(session)
-    view = build_game_buttons(session)
-
-    msg = await interaction.followup.send(
-        f"⚔️ **{host.display_name}** vs **{challenger.display_name}**\n\n{host.display_name}'s turn!",
-        file=board_file, view=view)
-    session.message = msg
-
-
-async def handle_play_card(interaction: discord.Interaction, session: GameSession, card_index: int):
-    """Handle a player playing a card."""
-    gs = session.game_state
-    user_id = str(interaction.user.id)
-
-    # Verify it's this player's turn
-    if gs.current_player.user_id != user_id:
-        await interaction.response.send_message("It's not your turn!", ephemeral=True)
-        return
-
-    if session.awaiting_blackmail:
-        await interaction.response.send_message("Waiting for opponent to resolve Blackmail!", ephemeral=True)
-        return
-
-    # Play the card
-    card = gs.current_player.hand[card_index] if card_index < len(gs.current_player.hand) else None
-    result = session.engine.play_card(card_index)
-
-    if not result.card_played and not result.messages:
-        await interaction.response.send_message("Invalid card!", ephemeral=True)
-        return
-
-    await interaction.response.defer()
-
-    channel = interaction.channel
-
-    # Show the card being played (with book open)
-    if result.card_played:
-        resolving_file = render_board_image(
-            session,
-            resolving_card_id=result.card_played.card_id,
-            resolving_player_is_bottom=(gs.player1.user_id == user_id or
-                                        (gs.current_player == gs.player1)),
-            book_open=True
-        )
-        log_text = "\n".join(result.messages[:5])  # First few messages
-        resolve_msg = await channel.send(f"📜 **Card Resolving...**\n{log_text}", file=resolving_file)
-
-        await asyncio.sleep(CARD_DISPLAY_TIME)
-        await resolve_msg.delete()
-
-    # Handle blackmail
-    if result.requires_blackmail_choice:
-        session.awaiting_blackmail = True
-        opponent = gs.get_opponent(gs.current_player)
-        session.blackmail_target_id = opponent.user_id
-
-        if opponent.is_bot:
-            # Bot chooses automatically
-            bot_ai = session.bot_ai
-            idx = bot_ai.choose_blackmail_discard(opponent)
-            blackmail_result = session.engine.resolve_blackmail_choice(idx)
-            session.awaiting_blackmail = False
-            result.messages.extend(blackmail_result.messages)
-            result.game_over = blackmail_result.game_over
-            result.game_over_messages.extend(blackmail_result.game_over_messages)
-        else:
-            # Ask human opponent to choose
-            view = BlackmailChoiceView(session, opponent)
-            await channel.send(
-                f"<@{opponent.user_id}> — You've been Blackmailed! Choose a card to discard:",
-                view=view)
-            return  # Don't continue turn processing until blackmail resolves
-
-    await post_turn_result(channel, session, result)
-
-
-async def handle_discard_card(interaction: discord.Interaction, session: GameSession, card_index: int):
-    """Handle a player discarding a card."""
-    gs = session.game_state
-    user_id = str(interaction.user.id)
-
-    if gs.current_player.user_id != user_id:
-        await interaction.response.send_message("It's not your turn!", ephemeral=True)
-        return
-
-    result = session.engine.discard_card(card_index)
-    await interaction.response.defer()
-    await post_turn_result(interaction.channel, session, result)
-
-
-async def post_turn_result(channel: discord.TextChannel, session: GameSession, result: TurnResult):
-    """Process a turn result: update board, check game over, handle bot turn."""
-    gs = session.game_state
-
-    # Build log text
-    log_text = "\n".join(result.messages[-10:])  # Last 10 messages
-
-    if result.game_over:
-        await handle_game_over(channel, session, result)
-        return
-
-    # Update board
-    board_file = render_board_image(session)
-
-    # Check if it's the bot's turn
-    if gs.current_player.is_bot and session.bot_ai:
-        # Show board state briefly
-        bot_msg = await channel.send(
-            f"📜 {log_text}\n\n🤖 **{gs.current_player.display_name}** is thinking...",
-            file=board_file)
-
-        await asyncio.sleep(2)
-
-        # Bot takes action
-        await handle_bot_turn(channel, session)
-    else:
-        # Human's turn — show buttons
-        view = build_game_buttons(session)
-        current_name = gs.current_player.display_name
-        await channel.send(
-            f"📜 {log_text}\n\n**{current_name}**'s turn!",
-            file=board_file, view=view)
-
-
-async def handle_bot_turn(channel: discord.TextChannel, session: GameSession):
-    """Handle the bot taking its turn."""
-    gs = session.game_state
-    bot_player = gs.current_player
-    bot_ai = session.bot_ai
-
-    if not bot_player.is_bot or not bot_ai:
-        return
-
-    action, index = bot_ai.choose_action(gs)
-
-    if action == "play" and index < len(bot_player.hand):
-        card = bot_player.hand[index]
-        result = session.engine.play_card(index)
-
-        # Show bot's card being played
-        if result.card_played:
-            is_bottom = (bot_player == gs.player1)
-            resolving_file = render_board_image(
-                session,
-                resolving_card_id=result.card_played.card_id,
-                resolving_player_is_bottom=is_bottom,
-                book_open=True
-            )
-            log_text = "\n".join(result.messages[:5])
-            resolve_msg = await channel.send(
-                f"🤖 **{bot_player.display_name}** plays **{result.card_played.name}**!\n{log_text}",
-                file=resolving_file)
-            await asyncio.sleep(CARD_DISPLAY_TIME)
-            await resolve_msg.delete()
-
-        # Handle blackmail from bot card (target is human)
-        if result.requires_blackmail_choice:
-            opponent = gs.get_opponent(bot_player)
-            if not opponent.is_bot:
-                session.awaiting_blackmail = True
-                session.blackmail_target_id = opponent.user_id
-                view = BlackmailChoiceView(session, opponent)
-
-                board_file = render_board_image(session)
-                await channel.send(
-                    f"<@{opponent.user_id}> — You've been Blackmailed! Choose a card to discard:",
-                    file=board_file, view=view)
-                return
-    else:
-        result = session.engine.discard_card(index if index < len(bot_player.hand) else 0)
-        if result.card_discarded:
-            result.messages.insert(0, f"🤖 **{bot_player.display_name}** discards a card.")
-
-    await post_turn_result(channel, session, result)
-
-
-async def handle_game_over(channel: discord.TextChannel, session: GameSession, result: TurnResult):
-    """Handle end of game - show results, update persistence."""
-    gs = session.game_state
-    channel_id = session.channel_id
-
-    # Remove from active games
-    active_games.pop(channel_id, None)
-
-    log_text = "\n".join(result.messages)
-
-    if gs.is_draw:
-        # Draw
-        board_file = render_board_image(session)
-        await channel.send(f"📜 {log_text}", file=board_file)
-
-        # Record draw for human players
-        for p in [gs.player1, gs.player2]:
-            if not p.is_bot:
-                record_draw(p.user_id)
-        return
-
-    winner = gs.winner
-    loser = gs.player1 if winner == gs.player2 else gs.player2
-
-    # Calculate XP for winner (only if human)
-    if not winner.is_bot:
-        xp_data = session.engine.calculate_xp(winner)
-        rank_data = add_xp(winner.user_id, xp_data["total"])
-        record_win(winner.user_id)
-
-        # Advance campaign if applicable
-        if session.is_campaign:
-            advance_campaign(winner.user_id)
-
-        # Render end screen
-        end_bytes = compositor.render_end_screen(winner, xp_data, rank_data)
-        end_file = discord.File(io.BytesIO(end_bytes), filename="results.png")
-
-        await channel.send(f"📜 {log_text}", file=end_file)
-
-        if rank_data["ranked_up"]:
-            await channel.send(
-                f"🎉 **{winner.display_name}** ranked up to "
-                f"**{rank_data['new_rank']}- {rank_data['new_rank_name']}**!")
-    else:
-        # Bot won
-        board_file = render_board_image(session)
-        await channel.send(f"📜 {log_text}\n\n💀 Better luck next time!", file=board_file)
-
-    # Record loss for the loser (if human)
-    if not loser.is_bot:
-        record_loss(loser.user_id)
-
-
-# === Slash Commands ===
-
-@bot.tree.command(name="play", description="Open the Necronomicon - start a game!")
-async def play_command(interaction: discord.Interaction):
-    """Main entry point - shows the game menu."""
-    menu_bytes = compositor.render_menu()
-    menu_file = discord.File(io.BytesIO(menu_bytes), filename="menu.png")
-    view = MainMenuView()
-    await interaction.response.send_message(file=menu_file, view=view)
-
-
-@bot.tree.command(name="campaign", description="Start your next campaign battle")
-async def campaign_command(interaction: discord.Interaction):
-    """Quick start for campaign."""
-    await start_campaign(interaction)
-
-
-@bot.tree.command(name="challenge", description="Challenge another player")
-@app_commands.describe(opponent="The player to challenge")
-async def challenge_command(interaction: discord.Interaction, opponent: discord.Member):
-    """Challenge a specific player."""
-    if opponent.id == interaction.user.id:
-        await interaction.response.send_message("You can't challenge yourself!", ephemeral=True)
-        return
-
-    if opponent.bot:
-        await interaction.response.send_message("Use /campaign to fight bots!", ephemeral=True)
-        return
-
-    channel_id = interaction.channel_id
-    if channel_id in active_games:
-        await interaction.response.send_message(
-            "A game is already in progress in this channel!", ephemeral=True)
-        return
-
-    # Create a targeted challenge
-    view = ChallengeAcceptView(interaction.user.id, opponent.id, channel_id)
-    await interaction.response.send_message(
-        f"⚔️ **{interaction.user.display_name}** challenges **{opponent.display_name}**!",
-        view=view)
+        if user_in_game(str(interaction.user.id)):
+            await interaction.response.send_message(
+                "You already have an active game! Finish or `/forfeit` it first.", ephemeral=True)
+            return
+        await start_multiplayer_game(interaction, self.host_id)
 
 
 class ChallengeAcceptView(discord.ui.View):
@@ -736,11 +381,11 @@ class ChallengeAcceptView(discord.ui.View):
         if interaction.user.id != self.target_id:
             await interaction.response.send_message("This challenge isn't for you!", ephemeral=True)
             return
-
-        # Simulate a lobby join
-        lobby = LobbyInfo(self.challenger_id, "", self.channel_id)
-        active_lobbies[self.channel_id] = lobby
-        await start_multiplayer_game(interaction, self.channel_id)
+        if user_in_game(str(interaction.user.id)):
+            await interaction.response.send_message(
+                "You already have an active game! Finish or `/forfeit` it first.", ephemeral=True)
+            return
+        await start_multiplayer_game(interaction, self.challenger_id)
 
     @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
     async def decline_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -752,9 +397,394 @@ class ChallengeAcceptView(discord.ui.View):
         self.stop()
 
 
+# === Game Flow Functions ===
+
+async def start_campaign(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+
+    if user_in_game(user_id):
+        await interaction.response.send_message(
+            "You already have an active game! Finish or `/forfeit` it first.", ephemeral=True)
+        return
+
+    user = interaction.user
+    player_data = load_player_data(user_id)
+    stage = player_data["campaign_stage"]
+    enemy_def = get_campaign_enemy(stage)
+
+    human = build_player_from_user(user, player_data)
+    human.build_deck(get_cards_for_rank(player_data["rank"]))
+    human.draw_initial_hand()
+
+    bot_player = build_bot_player(enemy_def)
+
+    game_state = GameState(human, bot_player)
+    game_state.game_id = str(uuid.uuid4())
+    engine = GameEngine(game_state)
+
+    difficulty = BotAI.get_difficulty_for_rank(enemy_def.rank)
+    bot_ai = BotAI(difficulty)
+
+    session = GameSession(
+        game_state=game_state, engine=engine,
+        channel_id=interaction.channel_id,
+        bot_ai=bot_ai, is_campaign=True
+    )
+    session.p1_avatar_bytes = await get_avatar_bytes(user)
+    register_session(session)
+
+    await interaction.response.defer()
+
+    board_file = render_board_file(session)
+    view = GameView(session)
+
+    stage_text = f"**Campaign Stage {stage + 1}/{get_total_campaign_stages()}**"
+    enemy_text = f"**VS {enemy_def.name}** (Rank {enemy_def.rank} - Life: {enemy_def.life})"
+    content = f"📖 {stage_text}\n{enemy_text}\n\n⚡ {user.display_name}'s turn!"
+
+    msg = await interaction.followup.send(content=content, file=board_file, view=view, wait=True)
+    session.message = msg
+
+
+async def create_multiplayer_lobby(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+
+    if user_in_game(user_id):
+        await interaction.response.send_message(
+            "You already have an active game! Finish or `/forfeit` it first.", ephemeral=True)
+        return
+
+    for lobby in active_lobbies.values():
+        if lobby.host_id == interaction.user.id:
+            await interaction.response.send_message("You already have an open lobby!", ephemeral=True)
+            return
+
+    user = interaction.user
+    lobby = LobbyInfo(user.id, user.display_name, interaction.channel_id)
+    active_lobbies[user.id] = lobby
+
+    view = MultiplayerLobbyView(user.id)
+    await interaction.response.send_message(
+        f"⚔️ **{user.display_name}** is looking for a challenger!\nClick **Join Game** to accept.",
+        view=view)
+
+
+async def start_multiplayer_game(interaction: discord.Interaction, host_id: int):
+    active_lobbies.pop(host_id, None)
+
+    host = await bot.fetch_user(host_id)
+    challenger = interaction.user
+
+    host_data = load_player_data(str(host.id))
+    challenger_data = load_player_data(str(challenger.id))
+
+    p1 = build_player_from_user(host, host_data)
+    p1.build_deck(get_cards_for_rank(host_data["rank"]))
+    p1.draw_initial_hand()
+
+    p2 = build_player_from_user(challenger, challenger_data)
+    p2.build_deck(get_cards_for_rank(challenger_data["rank"]))
+    p2.draw_initial_hand()
+
+    game_state = GameState(p1, p2)
+    game_state.game_id = str(uuid.uuid4())
+    engine = GameEngine(game_state)
+
+    session = GameSession(
+        game_state=game_state, engine=engine,
+        channel_id=interaction.channel_id, is_multiplayer=True
+    )
+    session.p1_avatar_bytes = await get_avatar_bytes(host)
+    session.p2_avatar_bytes = await get_avatar_bytes(challenger)
+    register_session(session)
+
+    await interaction.response.defer()
+
+    board_file = render_board_file(session)
+    view = GameView(session)
+
+    content = f"⚔️ **{host.display_name}** vs **{challenger.display_name}**\n\n⚡ {host.display_name}'s turn!"
+    msg = await interaction.followup.send(content=content, file=board_file, view=view, wait=True)
+    session.message = msg
+
+
+async def handle_play_card(interaction: discord.Interaction, session: GameSession, card_index: int):
+    gs = session.game_state
+    user_id = str(interaction.user.id)
+
+    if gs.current_player.user_id != user_id:
+        await interaction.response.send_message("It's not your turn!", ephemeral=True)
+        return
+
+    if session.awaiting_blackmail:
+        await interaction.response.send_message("Waiting for opponent to resolve Blackmail!", ephemeral=True)
+        return
+
+    async with session.lock:
+        if card_index >= len(gs.current_player.hand):
+            await interaction.response.send_message("Invalid card!", ephemeral=True)
+            return
+
+        card = gs.current_player.hand[card_index]
+        is_bottom = (gs.current_player == gs.player1)
+
+        # Acknowledge immediately
+        await interaction.response.defer()
+
+        # === Phase 1: Show card resolving (book open, card visible) ===
+        resolving_file = render_board_file(
+            session, resolving_card_id=card.card_id,
+            resolving_player_is_bottom=is_bottom, book_open=True
+        )
+        await update_game_message(
+            session,
+            f"📜 **{gs.current_player.display_name}** plays **{card.name}**...",
+            file=resolving_file, view=None
+        )
+
+        await asyncio.sleep(CARD_DISPLAY_TIME)
+
+        # === Phase 2: Execute the card ===
+        result = session.engine.play_card(card_index)
+
+        if not result.card_played and not result.messages:
+            board_file = render_board_file(session)
+            view = GameView(session)
+            await update_game_message(session, "Invalid card!", file=board_file, view=view)
+            return
+
+        # Handle blackmail
+        if result.requires_blackmail_choice:
+            session.awaiting_blackmail = True
+            opponent = gs.get_opponent(gs.current_player)
+            session.blackmail_target_id = opponent.user_id
+
+            if opponent.is_bot:
+                idx = session.bot_ai.choose_blackmail_discard(opponent)
+                bm_result = session.engine.resolve_blackmail_choice(idx)
+                session.awaiting_blackmail = False
+                result.messages.extend(bm_result.messages)
+                result.game_over = bm_result.game_over
+                result.game_over_messages.extend(bm_result.game_over_messages)
+            else:
+                log_text = "\n".join(result.messages[-8:])
+                board_file = render_board_file(session)
+                await update_game_message(
+                    session,
+                    f"📜 {log_text}\n\n⏳ Waiting for {opponent.display_name} to discard a card...",
+                    file=board_file, view=None
+                )
+                channel = bot.get_channel(session.channel_id)
+                if channel:
+                    bm_view = BlackmailChoiceView(session, opponent)
+                    await channel.send(
+                        f"<@{opponent.user_id}> — You've been Blackmailed! Choose a card to discard:",
+                        view=bm_view)
+                return
+
+        await post_turn_result(session, result)
+
+
+async def handle_discard_card(interaction: discord.Interaction, session: GameSession, card_index: int):
+    gs = session.game_state
+    user_id = str(interaction.user.id)
+
+    if gs.current_player.user_id != user_id:
+        await interaction.response.send_message("It's not your turn!", ephemeral=True)
+        return
+
+    async with session.lock:
+        result = session.engine.discard_card(card_index)
+        try:
+            await interaction.response.defer()
+        except discord.InteractionResponded:
+            pass
+        await post_turn_result(session, result)
+
+
+async def post_turn_result(session: GameSession, result: TurnResult):
+    gs = session.game_state
+    log_text = "\n".join(result.messages[-10:])
+
+    if result.game_over:
+        await handle_game_over(session, result)
+        return
+
+    if gs.current_player.is_bot and session.bot_ai:
+        board_file = render_board_file(session)
+        await update_game_message(
+            session,
+            f"📜 {log_text}\n\n🤖 **{gs.current_player.display_name}** is thinking...",
+            file=board_file, view=None
+        )
+        await asyncio.sleep(2)
+        await handle_bot_turn(session)
+    else:
+        board_file = render_board_file(session)
+        view = GameView(session)
+        current_name = gs.current_player.display_name
+        await update_game_message(
+            session,
+            f"📜 {log_text}\n\n⚡ **{current_name}**'s turn!",
+            file=board_file, view=view
+        )
+
+
+async def handle_bot_turn(session: GameSession):
+    gs = session.game_state
+    bot_player = gs.current_player
+    bot_ai = session.bot_ai
+
+    if not bot_player.is_bot or not bot_ai:
+        return
+
+    action, index = bot_ai.choose_action(gs)
+
+    if action == "play" and index < len(bot_player.hand):
+        card = bot_player.hand[index]
+        is_bottom = (bot_player == gs.player1)
+
+        # Phase 1: Show bot's card
+        resolving_file = render_board_file(
+            session, resolving_card_id=card.card_id,
+            resolving_player_is_bottom=is_bottom, book_open=True
+        )
+        await update_game_message(
+            session,
+            f"🤖 **{bot_player.display_name}** plays **{card.name}**...",
+            file=resolving_file, view=None
+        )
+        await asyncio.sleep(CARD_DISPLAY_TIME)
+
+        # Phase 2: Execute
+        result = session.engine.play_card(index)
+
+        # Handle blackmail targeting human
+        if result.requires_blackmail_choice:
+            opponent = gs.get_opponent(bot_player)
+            if not opponent.is_bot:
+                session.awaiting_blackmail = True
+                session.blackmail_target_id = opponent.user_id
+
+                log_text = "\n".join(result.messages[-8:])
+                board_file = render_board_file(session)
+                await update_game_message(
+                    session,
+                    f"📜 {log_text}\n\n⏳ Waiting for {opponent.display_name} to discard a card...",
+                    file=board_file, view=None
+                )
+                channel = bot.get_channel(session.channel_id)
+                if channel:
+                    bm_view = BlackmailChoiceView(session, opponent)
+                    await channel.send(
+                        f"<@{opponent.user_id}> — You've been Blackmailed! Choose a card to discard:",
+                        view=bm_view)
+                return
+    else:
+        safe_index = min(index, len(bot_player.hand) - 1) if bot_player.hand else 0
+        result = session.engine.discard_card(safe_index)
+
+    await post_turn_result(session, result)
+
+
+async def handle_game_over(session: GameSession, result: TurnResult):
+    gs = session.game_state
+    log_text = "\n".join(result.messages)
+
+    if gs.is_draw:
+        board_file = render_board_file(session)
+        await update_game_message(
+            session, f"📜 {log_text}\n\n🤝 **DRAW!**",
+            file=board_file, view=None
+        )
+        for p in [gs.player1, gs.player2]:
+            if not p.is_bot:
+                record_draw(p.user_id)
+        unregister_session(session)
+        return
+
+    winner = gs.winner
+    loser = gs.player1 if winner == gs.player2 else gs.player2
+
+    if not winner.is_bot:
+        xp_data = session.engine.calculate_xp(winner)
+        rank_data = add_xp(winner.user_id, xp_data["total"])
+        record_win(winner.user_id)
+
+        if session.is_campaign:
+            advance_campaign(winner.user_id)
+
+        end_bytes = compositor.render_end_screen(winner, xp_data, rank_data)
+        end_file = discord.File(io.BytesIO(end_bytes), filename="results.png")
+
+        content = f"📜 {log_text}\n\n🏆 **{winner.display_name}** is victorious!"
+        if rank_data["ranked_up"]:
+            content += f"\n🎉 Ranked up to **{rank_data['new_rank']}- {rank_data['new_rank_name']}**!"
+
+        await update_game_message(session, content, file=end_file, view=None)
+    else:
+        board_file = render_board_file(session)
+        await update_game_message(
+            session,
+            f"📜 {log_text}\n\n💀 **{winner.display_name}** wins! Better luck next time!",
+            file=board_file, view=None
+        )
+
+    if not loser.is_bot:
+        record_loss(loser.user_id)
+
+    unregister_session(session)
+
+
+# === Slash Commands ===
+
+@bot.tree.command(name="play", description="Open the Necronomicon - start a game!")
+async def play_command(interaction: discord.Interaction):
+    if user_in_game(str(interaction.user.id)):
+        await interaction.response.send_message(
+            "You already have an active game! Finish or `/forfeit` it first.", ephemeral=True)
+        return
+
+    menu_bytes = compositor.render_menu()
+    menu_file = discord.File(io.BytesIO(menu_bytes), filename="menu.png")
+    view = MainMenuView()
+    await interaction.response.send_message(file=menu_file, view=view)
+
+
+@bot.tree.command(name="campaign", description="Start your next campaign battle")
+async def campaign_command(interaction: discord.Interaction):
+    await start_campaign(interaction)
+
+
+@bot.tree.command(name="challenge", description="Challenge another player")
+@app_commands.describe(opponent="The player to challenge")
+async def challenge_command(interaction: discord.Interaction, opponent: discord.Member):
+    user_id = str(interaction.user.id)
+    target_id = str(opponent.id)
+
+    if opponent.id == interaction.user.id:
+        await interaction.response.send_message("You can't challenge yourself!", ephemeral=True)
+        return
+    if opponent.bot:
+        await interaction.response.send_message("Use /campaign to fight bots!", ephemeral=True)
+        return
+    if user_in_game(user_id):
+        await interaction.response.send_message(
+            "You already have an active game! Finish or `/forfeit` it first.", ephemeral=True)
+        return
+    if user_in_game(target_id):
+        await interaction.response.send_message(
+            f"{opponent.display_name} is already in a game!", ephemeral=True)
+        return
+
+    view = ChallengeAcceptView(interaction.user.id, opponent.id, interaction.channel_id)
+    await interaction.response.send_message(
+        f"⚔️ **{interaction.user.display_name}** challenges **{opponent.display_name}**!",
+        view=view)
+
+
 @bot.tree.command(name="stats", description="View your player stats and rank")
 async def stats_command(interaction: discord.Interaction):
-    """View player stats."""
     data = load_player_data(str(interaction.user.id))
     rank = data["rank"]
     rank_name = RANK_NAMES.get(rank, f"Rank {rank}")
@@ -770,7 +800,6 @@ async def stats_command(interaction: discord.Interaction):
     embed.add_field(name="Losses", value=str(data["losses"]), inline=True)
     embed.add_field(name="Draws", value=str(data["draws"]), inline=True)
 
-    # Cards unlocked
     unlocked = len(get_cards_for_rank(rank))
     total = len(ALL_CARDS)
     embed.add_field(name="Cards Unlocked", value=f"{unlocked}/{total}", inline=True)
@@ -780,21 +809,15 @@ async def stats_command(interaction: discord.Interaction):
 
 @bot.tree.command(name="forfeit", description="Forfeit the current game")
 async def forfeit_command(interaction: discord.Interaction):
-    """Forfeit the current game."""
-    channel_id = interaction.channel_id
-    if channel_id not in active_games:
-        await interaction.response.send_message("No active game in this channel!", ephemeral=True)
-        return
-
-    session = active_games[channel_id]
-    gs = session.game_state
     user_id = str(interaction.user.id)
 
-    if user_id not in (gs.player1.user_id, gs.player2.user_id):
-        await interaction.response.send_message("You're not in this game!", ephemeral=True)
+    if not user_in_game(user_id):
+        await interaction.response.send_message("You don't have an active game!", ephemeral=True)
         return
 
-    # Determine winner/loser
+    session = get_session_for_user(user_id)
+    gs = session.game_state
+
     if user_id == gs.player1.user_id:
         gs.winner = gs.player2
     else:
@@ -804,15 +827,16 @@ async def forfeit_command(interaction: discord.Interaction):
     forfeit_result = TurnResult()
     forfeit_result.game_over = True
     forfeit_result.messages.append(f"🏳️ **{interaction.user.display_name}** forfeits!")
-    forfeit_result.game_over_messages.append(f"🏆 **{gs.winner.display_name}** wins by forfeit!")
+    forfeit_result.game_over_messages.append(
+        f"🏆 **{gs.winner.display_name}** wins by forfeit!")
+    forfeit_result.messages.extend(forfeit_result.game_over_messages)
 
     await interaction.response.defer()
-    await handle_game_over(interaction.channel, session, forfeit_result)
+    await handle_game_over(session, forfeit_result)
 
 
 @bot.tree.command(name="cardlist", description="View all available cards")
 async def cardlist_command(interaction: discord.Interaction):
-    """View all cards in the game."""
     data = load_player_data(str(interaction.user.id))
     rank = data["rank"]
 
@@ -822,7 +846,6 @@ async def cardlist_command(interaction: discord.Interaction):
         cost = f"San: {card.sanity_cost}"
         lines.append(f"{unlocked} **{card.name}** — {card.description} ({cost})")
 
-    # Split into chunks for Discord message limits
     chunks = []
     current = ""
     for line in lines:
@@ -856,7 +879,6 @@ async def on_ready():
 def main():
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
-        # Try loading from .env file
         env_path = os.path.join(os.path.dirname(__file__), ".env")
         if os.path.exists(env_path):
             with open(env_path) as f:
