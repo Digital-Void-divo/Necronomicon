@@ -36,8 +36,6 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 compositor = ImageCompositor()
 
-GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
-
 # Active games: channel_id -> GameSession
 active_games: dict[int, "GameSession"] = {}
 
@@ -856,7 +854,7 @@ async def on_ready():
 # === Entry Point ===
 
 def main():
-    token = GITHUB_TOKEN
+    token = os.environ.get("DISCORD_TOKEN")
     if not token:
         # Try loading from .env file
         env_path = os.path.join(os.path.dirname(__file__), ".env")
