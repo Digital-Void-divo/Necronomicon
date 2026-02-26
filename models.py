@@ -6,7 +6,8 @@ from typing import Optional
 from config import (
     BASE_LIFE, LIFE_PER_RANK, MAX_LIFE_CAP, STARTING_SANITY,
     DEFAULT_HAND_SIZE, AGORAPHOBIA_HAND_SIZE, MIN_TAINT,
-    MIN_ARCANE, MIN_ELDER_DEFENSE, MADNESS_TYPES, MAX_RANK
+    MIN_ARCANE, MIN_ELDER_DEFENSE, MADNESS_TYPES, MAX_RANK,
+    RANK_NAMES
 )
 
 
@@ -76,6 +77,11 @@ class Player:
     def _calculate_starting_life(self) -> int:
         life = BASE_LIFE + (self.rank - 1) * LIFE_PER_RANK
         return min(life, MAX_LIFE_CAP)
+
+    @property
+    def rank_title(self) -> str:
+        """Get the rank title name for display."""
+        return RANK_NAMES.get(self.rank, f"Rank {self.rank}")
 
     def override_starting_stats(self, life: int = None, sanity: int = None,
                                 taint: int = None, arcane: int = None,

@@ -1,12 +1,7 @@
 """Necronomicon Card Game - Discord Bot
 
-Main entry point. Handles slash commands, button interactions,
-game session management, and ties everything together.
-
-Games are tracked per-user (not per-channel), so multiple games
-can run simultaneously in the same channel. Each game is a single
-message that gets edited in place with updated board images and buttons.
-Each player can only have one active game at a time.
+Games tracked per-user. Each game is one message edited in place.
+One active game per player. Audio plays in voice if user is in VC.
 """
 
 import os
@@ -30,6 +25,7 @@ from persistence import (
     advance_campaign, record_win, record_loss, record_draw
 )
 from config import CARD_DISPLAY_TIME, RANK_NAMES
+from audio import audio_manager
 
 
 # === Bot Setup ===
@@ -42,10 +38,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 compositor = ImageCompositor()
 
 # Active games: user_id (str) -> GameSession
-# Both players in a multiplayer game point to the SAME session
 active_games: dict[str, "GameSession"] = {}
-
-# Multiplayer lobbies: host_user_id (int) -> LobbyInfo
 active_lobbies: dict[int, "LobbyInfo"] = {}
 
 
@@ -57,27 +50,27 @@ class LobbyInfo:
 
 
 class GameSession:
-    """Tracks a game session tied to one or two users."""
-
     def __init__(self, game_state: GameState, engine: GameEngine,
-                 channel_id: int, bot_ai: BotAI = None,
+                 channel_id: int, guild_id: int = None,
+                 bot_ai: BotAI = None,
                  is_campaign: bool = False, is_multiplayer: bool = False):
         self.game_state = game_state
         self.engine = engine
         self.channel_id = channel_id
+        self.guild_id = guild_id
         self.bot_ai = bot_ai
         self.is_campaign = is_campaign
         self.is_multiplayer = is_multiplayer
-        self.message: Optional[discord.Message] = None  # The single game message we edit
+        self.message: Optional[discord.Message] = None
         self.p1_avatar_bytes: bytes = None
         self.p2_avatar_bytes: bytes = None
         self.awaiting_blackmail: bool = False
         self.blackmail_target_id: str = None
-        self.lock = asyncio.Lock()  # Prevent concurrent edits
+        self.lock = asyncio.Lock()
+        self.audio_active: bool = False  # True if bot joined VC for this session
 
     @property
     def player_ids(self) -> list[str]:
-        """Return list of human player user IDs in this session."""
         ids = []
         if not self.game_state.player1.is_bot:
             ids.append(self.game_state.player1.user_id)
@@ -86,30 +79,37 @@ class GameSession:
         return ids
 
 
-# === Helper Functions ===
+# === Helpers ===
 
 def get_session_for_user(user_id: str) -> Optional[GameSession]:
     return active_games.get(user_id)
 
-
 def user_in_game(user_id: str) -> bool:
     return user_id in active_games
-
 
 def register_session(session: GameSession):
     for uid in session.player_ids:
         active_games[uid] = session
-
 
 def unregister_session(session: GameSession):
     for uid in session.player_ids:
         active_games.pop(uid, None)
 
 
-async def get_avatar_bytes(user: discord.User) -> bytes:
+async def get_avatar_bytes(user: discord.User) -> Optional[bytes]:
     try:
         if user.avatar:
             return await user.avatar.read()
+    except Exception:
+        pass
+    return None
+
+
+async def get_bot_avatar_bytes() -> Optional[bytes]:
+    """Get the bot's own avatar for use as campaign enemy portrait."""
+    try:
+        if bot.user and bot.user.avatar:
+            return await bot.user.avatar.read()
     except Exception:
         pass
     return None
@@ -163,7 +163,7 @@ def render_board_file(session: GameSession, resolving_card_id: str = None,
 async def update_game_message(session: GameSession, content: str,
                               file: discord.File = None,
                               view: discord.ui.View = None):
-    """Edit the game message in place. Falls back to sending new if needed."""
+    """Edit the game message in place."""
     try:
         if session.message:
             if file:
@@ -186,6 +186,15 @@ async def update_game_message(session: GameSession, content: str,
             session.message = await channel.send(**kwargs)
     except discord.HTTPException as e:
         print(f"Error updating game message: {e}")
+
+
+async def try_play_audio(session: GameSession, coro):
+    """Play audio if the session has an active voice connection."""
+    if session.audio_active and session.guild_id:
+        try:
+            await coro
+        except Exception as e:
+            print(f"Audio error: {e}")
 
 
 # === Discord UI Views ===
@@ -226,8 +235,7 @@ class GameView(discord.ui.View):
 
         for i in range(len(current.hand)):
             can_play, _ = current.can_play_card(i)
-            card = current.hand[i]
-            self.add_item(PlayCardButton(session, i, card.name, can_play))
+            self.add_item(PlayCardButton(session, i, can_play))
 
         self.add_item(DiscardSelectButton(session))
 
@@ -270,7 +278,7 @@ class ViewHandButton(discord.ui.Button):
 
 
 class PlayCardButton(discord.ui.Button):
-    def __init__(self, session: GameSession, index: int, card_name: str, can_play: bool):
+    def __init__(self, session: GameSession, index: int, can_play: bool):
         label = f"Play [{index + 1}]"
         style = discord.ButtonStyle.success if can_play else discord.ButtonStyle.secondary
         super().__init__(label=label, style=style, disabled=not can_play, row=1 + index // 5)
@@ -289,11 +297,9 @@ class DiscardSelectButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         gs = self.session.game_state
         user_id = str(interaction.user.id)
-
         if gs.current_player.user_id != user_id:
             await interaction.response.send_message("It's not your turn!", ephemeral=True)
             return
-
         view = DiscardChoiceView(self.session)
         await interaction.response.send_message("Select a card to discard:", view=view, ephemeral=True)
 
@@ -301,15 +307,12 @@ class DiscardSelectButton(discord.ui.Button):
 class DiscardChoiceView(discord.ui.View):
     def __init__(self, session: GameSession):
         super().__init__(timeout=60)
-        self.session = session
         player = session.game_state.current_player
         options = []
         for i, card in enumerate(player.hand):
+            desc = f"Gain {card.sanity_cost} Sanity" if card.sanity_cost > 0 else "No Sanity gain"
             options.append(discord.SelectOption(
-                label=f"[{i+1}] {card.name}",
-                description=f"Gain {card.sanity_cost} Sanity" if card.sanity_cost > 0 else "No Sanity gain",
-                value=str(i)
-            ))
+                label=f"[{i+1}] {card.name}", description=desc, value=str(i)))
         self.add_item(DiscardSelect(session, options))
 
 
@@ -326,13 +329,10 @@ class DiscardSelect(discord.ui.Select):
 class BlackmailChoiceView(discord.ui.View):
     def __init__(self, session: GameSession, target_player: Player):
         super().__init__(timeout=60)
-        self.session = session
         options = []
         for i, card in enumerate(target_player.hand):
             options.append(discord.SelectOption(
-                label=f"[{i+1}] {card.name}",
-                value=str(i)
-            ))
+                label=f"[{i+1}] {card.name}", value=str(i)))
         self.add_item(BlackmailSelect(session, options))
 
 
@@ -347,7 +347,6 @@ class BlackmailSelect(discord.ui.Select):
             result = self.session.engine.resolve_blackmail_choice(idx)
             self.session.awaiting_blackmail = False
             self.session.blackmail_target_id = None
-
             await interaction.response.send_message("You discarded a card.", ephemeral=True)
             await post_turn_result(self.session, result)
 
@@ -370,11 +369,10 @@ class MultiplayerLobbyView(discord.ui.View):
 
 
 class ChallengeAcceptView(discord.ui.View):
-    def __init__(self, challenger_id: int, target_id: int, channel_id: int):
+    def __init__(self, challenger_id: int, target_id: int):
         super().__init__(timeout=120)
         self.challenger_id = challenger_id
         self.target_id = target_id
-        self.channel_id = channel_id
 
     @discord.ui.button(label="Accept Challenge", style=discord.ButtonStyle.success, emoji="⚔️")
     async def accept_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -397,11 +395,19 @@ class ChallengeAcceptView(discord.ui.View):
         self.stop()
 
 
-# === Game Flow Functions ===
+# === Game Flow ===
+
+async def setup_audio_for_session(session: GameSession, member: discord.Member):
+    """If the member is in a voice channel, join it and mark audio as active."""
+    if member.voice and member.voice.channel:
+        vc = await audio_manager.try_join_voice(member)
+        if vc:
+            session.audio_active = True
+            session.guild_id = member.guild.id
+
 
 async def start_campaign(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
-
     if user_in_game(user_id):
         await interaction.response.send_message(
             "You already have an active game! Finish or `/forfeit` it first.", ephemeral=True)
@@ -425,22 +431,32 @@ async def start_campaign(interaction: discord.Interaction):
     difficulty = BotAI.get_difficulty_for_rank(enemy_def.rank)
     bot_ai = BotAI(difficulty)
 
+    guild_id = interaction.guild.id if interaction.guild else None
     session = GameSession(
         game_state=game_state, engine=engine,
-        channel_id=interaction.channel_id,
+        channel_id=interaction.channel_id, guild_id=guild_id,
         bot_ai=bot_ai, is_campaign=True
     )
     session.p1_avatar_bytes = await get_avatar_bytes(user)
+    # Use the bot's own avatar for campaign enemies
+    session.p2_avatar_bytes = await get_bot_avatar_bytes()
     register_session(session)
 
+    # Try to join voice channel for audio
+    if isinstance(user, discord.Member):
+        await setup_audio_for_session(session, user)
+
     await interaction.response.defer()
+
+    # Play battle start audio
+    await try_play_audio(session, audio_manager.play_battle_start(guild_id))
 
     board_file = render_board_file(session)
     view = GameView(session)
 
     stage_text = f"**Campaign Stage {stage + 1}/{get_total_campaign_stages()}**"
     enemy_text = f"**VS {enemy_def.name}** (Rank {enemy_def.rank} - Life: {enemy_def.life})"
-    content = f"📖 {stage_text}\n{enemy_text}\n\n⚡ {user.display_name}'s turn!"
+    content = f"📖 {stage_text}\n{enemy_text}"
 
     msg = await interaction.followup.send(content=content, file=board_file, view=view, wait=True)
     session.message = msg
@@ -448,24 +464,20 @@ async def start_campaign(interaction: discord.Interaction):
 
 async def create_multiplayer_lobby(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
-
     if user_in_game(user_id):
         await interaction.response.send_message(
             "You already have an active game! Finish or `/forfeit` it first.", ephemeral=True)
         return
-
     for lobby in active_lobbies.values():
         if lobby.host_id == interaction.user.id:
             await interaction.response.send_message("You already have an open lobby!", ephemeral=True)
             return
 
-    user = interaction.user
-    lobby = LobbyInfo(user.id, user.display_name, interaction.channel_id)
-    active_lobbies[user.id] = lobby
-
-    view = MultiplayerLobbyView(user.id)
+    lobby = LobbyInfo(interaction.user.id, interaction.user.display_name, interaction.channel_id)
+    active_lobbies[interaction.user.id] = lobby
+    view = MultiplayerLobbyView(interaction.user.id)
     await interaction.response.send_message(
-        f"⚔️ **{user.display_name}** is looking for a challenger!\nClick **Join Game** to accept.",
+        f"⚔️ **{interaction.user.display_name}** is looking for a challenger!\nClick **Join Game** to accept.",
         view=view)
 
 
@@ -490,20 +502,27 @@ async def start_multiplayer_game(interaction: discord.Interaction, host_id: int)
     game_state.game_id = str(uuid.uuid4())
     engine = GameEngine(game_state)
 
+    guild_id = interaction.guild.id if interaction.guild else None
     session = GameSession(
         game_state=game_state, engine=engine,
-        channel_id=interaction.channel_id, is_multiplayer=True
+        channel_id=interaction.channel_id, guild_id=guild_id,
+        is_multiplayer=True
     )
     session.p1_avatar_bytes = await get_avatar_bytes(host)
     session.p2_avatar_bytes = await get_avatar_bytes(challenger)
     register_session(session)
 
+    # Try to join voice
+    if isinstance(interaction.user, discord.Member):
+        await setup_audio_for_session(session, interaction.user)
+
     await interaction.response.defer()
+    await try_play_audio(session, audio_manager.play_battle_start(guild_id))
 
     board_file = render_board_file(session)
     view = GameView(session)
 
-    content = f"⚔️ **{host.display_name}** vs **{challenger.display_name}**\n\n⚡ {host.display_name}'s turn!"
+    content = f"⚔️ **{host.display_name}** vs **{challenger.display_name}**"
     msg = await interaction.followup.send(content=content, file=board_file, view=view, wait=True)
     session.message = msg
 
@@ -515,7 +534,6 @@ async def handle_play_card(interaction: discord.Interaction, session: GameSessio
     if gs.current_player.user_id != user_id:
         await interaction.response.send_message("It's not your turn!", ephemeral=True)
         return
-
     if session.awaiting_blackmail:
         await interaction.response.send_message("Waiting for opponent to resolve Blackmail!", ephemeral=True)
         return
@@ -528,10 +546,13 @@ async def handle_play_card(interaction: discord.Interaction, session: GameSessio
         card = gs.current_player.hand[card_index]
         is_bottom = (gs.current_player == gs.player1)
 
-        # Acknowledge immediately
         await interaction.response.defer()
 
-        # === Phase 1: Show card resolving (book open, card visible) ===
+        # Play card sound
+        await try_play_audio(session,
+            audio_manager.play_card_sound(session.guild_id, card.card_id))
+
+        # Phase 1: Show card resolving
         resolving_file = render_board_file(
             session, resolving_card_id=card.card_id,
             resolving_player_is_bottom=is_bottom, book_open=True
@@ -541,10 +562,9 @@ async def handle_play_card(interaction: discord.Interaction, session: GameSessio
             f"📜 **{gs.current_player.display_name}** plays **{card.name}**...",
             file=resolving_file, view=None
         )
-
         await asyncio.sleep(CARD_DISPLAY_TIME)
 
-        # === Phase 2: Execute the card ===
+        # Phase 2: Execute
         result = session.engine.play_card(card_index)
 
         if not result.card_played and not result.messages:
@@ -552,6 +572,14 @@ async def handle_play_card(interaction: discord.Interaction, session: GameSessio
             view = GameView(session)
             await update_game_message(session, "Invalid card!", file=board_file, view=view)
             return
+
+        # Check if anyone went insane
+        await _check_insanity_audio(session, result)
+
+        # Check for monster combat audio
+        if result.monster_combat_occurred:
+            await try_play_audio(session,
+                audio_manager.play_monster_attack(session.guild_id))
 
         # Handle blackmail
         if result.requires_blackmail_choice:
@@ -571,7 +599,7 @@ async def handle_play_card(interaction: discord.Interaction, session: GameSessio
                 board_file = render_board_file(session)
                 await update_game_message(
                     session,
-                    f"📜 {log_text}\n\n⏳ Waiting for {opponent.display_name} to discard a card...",
+                    f"📜 {log_text}\n\n⏳ Waiting for {opponent.display_name} to discard...",
                     file=board_file, view=None
                 )
                 channel = bot.get_channel(session.channel_id)
@@ -588,7 +616,6 @@ async def handle_play_card(interaction: discord.Interaction, session: GameSessio
 async def handle_discard_card(interaction: discord.Interaction, session: GameSession, card_index: int):
     gs = session.game_state
     user_id = str(interaction.user.id)
-
     if gs.current_player.user_id != user_id:
         await interaction.response.send_message("It's not your turn!", ephemeral=True)
         return
@@ -614,7 +641,7 @@ async def post_turn_result(session: GameSession, result: TurnResult):
         board_file = render_board_file(session)
         await update_game_message(
             session,
-            f"📜 {log_text}\n\n🤖 **{gs.current_player.display_name}** is thinking...",
+            f"📜 {log_text}",
             file=board_file, view=None
         )
         await asyncio.sleep(2)
@@ -622,10 +649,9 @@ async def post_turn_result(session: GameSession, result: TurnResult):
     else:
         board_file = render_board_file(session)
         view = GameView(session)
-        current_name = gs.current_player.display_name
         await update_game_message(
             session,
-            f"📜 {log_text}\n\n⚡ **{current_name}**'s turn!",
+            f"📜 {log_text}",
             file=board_file, view=view
         )
 
@@ -644,6 +670,10 @@ async def handle_bot_turn(session: GameSession):
         card = bot_player.hand[index]
         is_bottom = (bot_player == gs.player1)
 
+        # Play card sound
+        await try_play_audio(session,
+            audio_manager.play_card_sound(session.guild_id, card.card_id))
+
         # Phase 1: Show bot's card
         resolving_file = render_board_file(
             session, resolving_card_id=card.card_id,
@@ -659,18 +689,23 @@ async def handle_bot_turn(session: GameSession):
         # Phase 2: Execute
         result = session.engine.play_card(index)
 
+        await _check_insanity_audio(session, result)
+
+        if result.monster_combat_occurred:
+            await try_play_audio(session,
+                audio_manager.play_monster_attack(session.guild_id))
+
         # Handle blackmail targeting human
         if result.requires_blackmail_choice:
             opponent = gs.get_opponent(bot_player)
             if not opponent.is_bot:
                 session.awaiting_blackmail = True
                 session.blackmail_target_id = opponent.user_id
-
                 log_text = "\n".join(result.messages[-8:])
                 board_file = render_board_file(session)
                 await update_game_message(
                     session,
-                    f"📜 {log_text}\n\n⏳ Waiting for {opponent.display_name} to discard a card...",
+                    f"📜 {log_text}\n\n⏳ Waiting for {opponent.display_name} to discard...",
                     file=board_file, view=None
                 )
                 channel = bot.get_channel(session.channel_id)
@@ -687,9 +722,23 @@ async def handle_bot_turn(session: GameSession):
     await post_turn_result(session, result)
 
 
+async def _check_insanity_audio(session: GameSession, result: TurnResult):
+    """Play insanity sound if any message mentions madness onset."""
+    for msg in result.messages:
+        if "Madness:" in msg or "Xenophobia" in msg or "Agoraphobia" in msg or \
+           "Megalomania" in msg or "Schizophrenia" in msg:
+            await try_play_audio(session,
+                audio_manager.play_insanity(session.guild_id))
+            break
+
+
 async def handle_game_over(session: GameSession, result: TurnResult):
     gs = session.game_state
     log_text = "\n".join(result.messages)
+
+    # Play battle end audio
+    await try_play_audio(session,
+        audio_manager.play_battle_end(session.guild_id))
 
     if gs.is_draw:
         board_file = render_board_file(session)
@@ -701,6 +750,11 @@ async def handle_game_over(session: GameSession, result: TurnResult):
             if not p.is_bot:
                 record_draw(p.user_id)
         unregister_session(session)
+
+        # Disconnect from voice after a delay
+        if session.audio_active and session.guild_id:
+            await asyncio.sleep(5)
+            await audio_manager.disconnect(session.guild_id)
         return
 
     winner = gs.winner
@@ -735,6 +789,11 @@ async def handle_game_over(session: GameSession, result: TurnResult):
 
     unregister_session(session)
 
+    # Disconnect from voice after a delay
+    if session.audio_active and session.guild_id:
+        await asyncio.sleep(5)
+        await audio_manager.disconnect(session.guild_id)
+
 
 # === Slash Commands ===
 
@@ -744,6 +803,13 @@ async def play_command(interaction: discord.Interaction):
         await interaction.response.send_message(
             "You already have an active game! Finish or `/forfeit` it first.", ephemeral=True)
         return
+
+    # Play menu audio if in voice
+    if interaction.guild and isinstance(interaction.user, discord.Member):
+        if interaction.user.voice and interaction.user.voice.channel:
+            vc = await audio_manager.try_join_voice(interaction.user)
+            if vc:
+                await audio_manager.play_menu_start(interaction.guild.id)
 
     menu_bytes = compositor.render_menu()
     menu_file = discord.File(io.BytesIO(menu_bytes), filename="menu.png")
@@ -777,7 +843,7 @@ async def challenge_command(interaction: discord.Interaction, opponent: discord.
             f"{opponent.display_name} is already in a game!", ephemeral=True)
         return
 
-    view = ChallengeAcceptView(interaction.user.id, opponent.id, interaction.channel_id)
+    view = ChallengeAcceptView(interaction.user.id, opponent.id)
     await interaction.response.send_message(
         f"⚔️ **{interaction.user.display_name}** challenges **{opponent.display_name}**!",
         view=view)
@@ -799,7 +865,6 @@ async def stats_command(interaction: discord.Interaction):
     embed.add_field(name="Wins", value=str(data["wins"]), inline=True)
     embed.add_field(name="Losses", value=str(data["losses"]), inline=True)
     embed.add_field(name="Draws", value=str(data["draws"]), inline=True)
-
     unlocked = len(get_cards_for_rank(rank))
     total = len(ALL_CARDS)
     embed.add_field(name="Cards Unlocked", value=f"{unlocked}/{total}", inline=True)
@@ -810,7 +875,6 @@ async def stats_command(interaction: discord.Interaction):
 @bot.tree.command(name="forfeit", description="Forfeit the current game")
 async def forfeit_command(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
-
     if not user_in_game(user_id):
         await interaction.response.send_message("You don't have an active game!", ephemeral=True)
         return
@@ -832,6 +896,8 @@ async def forfeit_command(interaction: discord.Interaction):
     forfeit_result.messages.extend(forfeit_result.game_over_messages)
 
     await interaction.response.defer()
+
+    # Directly handle game over — skip post_turn_result to avoid "thinking" state
     await handle_game_over(session, forfeit_result)
 
 
@@ -893,14 +959,13 @@ def main():
         print('DISCORD_TOKEN=your_token_here')
         return
 
-    # Debug: show token info to diagnose auth issues (remove after confirmed working)
+    # Debug: show token info (remove after confirmed working)
     print(f"[DEBUG] Token length: {len(token)}")
     print(f"[DEBUG] Token starts with: {token[:5]}...")
     print(f"[DEBUG] Token ends with: ...{token[-5:]}")
     has_quotes = token.startswith('"') or token.startswith("'")
     print(f"[DEBUG] Token has quotes: {has_quotes}")
-    print(f"[DEBUG] Token has newlines: {chr(10) in token or chr(13) in token}")
-    print(f"[DEBUG] Source: environment variable" if os.environ.get("DISCORD_TOKEN") else "[DEBUG] Source: .env file")
+    print(f"[DEBUG] Source: {'env var' if os.environ.get('DISCORD_TOKEN') else '.env file'}")
 
     bot.run(token)
 

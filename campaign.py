@@ -23,7 +23,7 @@ CAMPAIGN_ENEMIES = [
     # Tier 1: Street Level (Ranks 1-3)
     CampaignEnemy(
         name="Street Thug",
-        rank=1, life=30, sanity=25,
+        rank=1, life=40, sanity=25,
         card_ids=["blast_em", "tommy_gun", "raid", "discreet_doctor",
                   "mi_go_surgery", "byakhee", "curse_of_cthulhu",
                   "blackmail", "elder_sign", "arkham_asylum"]

@@ -93,3 +93,42 @@ PLAYER_DATA_DIR = "data/players"
 
 # === Card Resolution Display Time (seconds) ===
 CARD_DISPLAY_TIME = 3
+
+# === Audio Paths ===
+AUDIO_DIR = f"{ASSETS_DIR}/audio"
+AUDIO_MENU_START = f"{AUDIO_DIR}/menu_start.mp3"
+AUDIO_MONSTER_ATTACK = f"{AUDIO_DIR}/monster_attack.mp3"
+AUDIO_PHYSICAL_ATTACK = f"{AUDIO_DIR}/physical_attack.mp3"
+AUDIO_MAGICAL_ATTACK = f"{AUDIO_DIR}/magical_attack.mp3"
+AUDIO_NON_ATTACK = f"{AUDIO_DIR}/non_attack.mp3"
+AUDIO_BATTLE_START = f"{AUDIO_DIR}/battle_start.mp3"
+AUDIO_BATTLE_END = f"{AUDIO_DIR}/battle_end.mp3"
+AUDIO_INSANITY = f"{AUDIO_DIR}/insanity.mp3"
+
+# Cards classified as "physical" attacks (no arcane involvement)
+PHYSICAL_ATTACK_CARDS = {
+    "blast_em", "tommy_gun", "raid", "sacrificial_lamb",
+}
+
+# Cards classified as "magical" attacks (involve arcane)
+MAGICAL_ATTACK_CARDS = {
+    "dark_ritual", "dark_young_charge", "mind_burn", "from_beyond",
+    "hound_of_tindalos", "rise_of_the_deep_ones", "black_goat_of_the_woods",
+    "yog_sothoth", "city_of_rlyeh", "betrayed", "mad_experiment",
+}
+
+# Cards that summon monsters
+SUMMON_CARDS = {
+    "byakhee", "dimensional_shambler", "shoggoth", "elder_thing",
+    "black_goat_of_the_woods",
+}
+
+# Non-attack cards (everything else)
+NON_ATTACK_CARDS = {
+    "pnakotic_manuscripts", "mi_go_surgery", "discreet_doctor",
+    "essence_of_the_soul", "elder_sign", "arkham_asylum",
+    "powder_of_ibn_ghazi", "dispel", "unaussprechlichen_kulten",
+    "blackmail", "curse_of_cthulhu", "king_in_yellow",
+    "blessing_of_hastur", "miskatonic_university", "doppelganger",
+    "dawn_of_a_new_day", "professor_armitage", "elder_thing",
+}

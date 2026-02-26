@@ -17,6 +17,7 @@ dirs = [
     f"{ASSETS_DIR}/symbols",
     f"{ASSETS_DIR}/fonts",
     f"{ASSETS_DIR}/ui",
+    f"{ASSETS_DIR}/audio",
 ]
 
 for d in dirs:
