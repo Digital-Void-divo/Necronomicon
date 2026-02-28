@@ -74,6 +74,15 @@ class GameEngine:
         madness_msgs = self._check_madness_on_play(player)
         result.messages.extend(madness_msgs)
 
+        # Consume one action
+        player.actions_remaining -= 1
+
+        # If more actions remain and no pending blackmail, hand control back to the player
+        if player.actions_remaining > 0 and not result.requires_blackmail_choice:
+            result.messages.append(
+                f"🔄 {player.display_name} has **{player.actions_remaining}** action(s) remaining.")
+            return result
+
         # If not waiting for blackmail, resolve end of turn
         if not result.requires_blackmail_choice:
             self._resolve_end_of_turn(player, opponent, result)
@@ -102,6 +111,15 @@ class GameEngine:
             result.messages.append(f"  Gains {sanity_gain} Sanity. (Sanity: {player.sanity})")
         else:
             result.messages.append(f"  No Sanity gained (0 cost card).")
+
+        # Consume one action
+        player.actions_remaining -= 1
+
+        # If more actions remain, return early
+        if player.actions_remaining > 0:
+            result.messages.append(
+                f"🔄 {player.display_name} has **{player.actions_remaining}** action(s) remaining.")
+            return result
 
         # Resolve end of turn
         self._resolve_end_of_turn(player, opponent, result)
