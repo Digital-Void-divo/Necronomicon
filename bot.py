@@ -199,6 +199,9 @@ async def try_play_audio(session: GameSession, coro):
 
 # === Discord UI Views ===
 
+GUIDE_TEXT = "**How to Play** instructions will be defined later."
+
+
 class MainMenuView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=120)
@@ -211,14 +214,18 @@ class MainMenuView(discord.ui.View):
     async def challenge_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message("Challenge Mode coming soon!", ephemeral=True)
 
-    @discord.ui.button(label="Multiplayer", style=discord.ButtonStyle.primary, emoji="👥", row=1)
+    @discord.ui.button(label="Multiplayer", style=discord.ButtonStyle.primary, emoji="👥", row=0)
     async def multiplayer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await create_multiplayer_lobby(interaction)
 
-    @discord.ui.button(label="How to Play", style=discord.ButtonStyle.secondary, emoji="❓", row=1)
-    async def howtoplay_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(
-            "**How to Play** instructions will be defined later.", ephemeral=True)
+    @discord.ui.button(label="Guide", style=discord.ButtonStyle.secondary, emoji="❓", row=0)
+    async def guide_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(GUIDE_TEXT, ephemeral=True)
+
+    @discord.ui.button(label="Exit", style=discord.ButtonStyle.secondary, emoji="✖️", row=0)
+    async def exit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.message.delete()
+        self.stop()
 
 
 class GameView(discord.ui.View):
@@ -231,18 +238,20 @@ class GameView(discord.ui.View):
         if current.is_bot:
             return
 
-        self.add_item(ViewHandButton(session))
-
+        # Row 0: Play card buttons (up to 5)
         for i in range(len(current.hand)):
             can_play, _ = current.can_play_card(i)
             self.add_item(PlayCardButton(session, i, can_play))
 
+        # Row 1: utility buttons
+        self.add_item(ViewHandButton(session))
         self.add_item(DiscardSelectButton(session))
+        self.add_item(InGameGuideButton())
 
 
 class ViewHandButton(discord.ui.Button):
     def __init__(self, session: GameSession):
-        super().__init__(label="View Hand", style=discord.ButtonStyle.secondary, emoji="👁️", row=0)
+        super().__init__(label="View Hand", style=discord.ButtonStyle.secondary, emoji="👁️", row=1)
         self.session = session
 
     async def callback(self, interaction: discord.Interaction):
@@ -279,9 +288,9 @@ class ViewHandButton(discord.ui.Button):
 
 class PlayCardButton(discord.ui.Button):
     def __init__(self, session: GameSession, index: int, can_play: bool):
-        label = f"Play [{index + 1}]"
+        label = f"Play {index + 1}"
         style = discord.ButtonStyle.success if can_play else discord.ButtonStyle.secondary
-        super().__init__(label=label, style=style, disabled=not can_play, row=1 + index // 5)
+        super().__init__(label=label, style=style, disabled=not can_play, row=0)
         self.session = session
         self.card_index = index
 
@@ -291,7 +300,7 @@ class PlayCardButton(discord.ui.Button):
 
 class DiscardSelectButton(discord.ui.Button):
     def __init__(self, session: GameSession):
-        super().__init__(label="Discard a Card", style=discord.ButtonStyle.danger, emoji="🗑️", row=3)
+        super().__init__(label="Discard a Card", style=discord.ButtonStyle.danger, emoji="🗑️", row=1)
         self.session = session
 
     async def callback(self, interaction: discord.Interaction):
@@ -302,6 +311,14 @@ class DiscardSelectButton(discord.ui.Button):
             return
         view = DiscardChoiceView(self.session)
         await interaction.response.send_message("Select a card to discard:", view=view, ephemeral=True)
+
+
+class InGameGuideButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Guide", style=discord.ButtonStyle.secondary, emoji="❓", row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message(GUIDE_TEXT, ephemeral=True)
 
 
 class DiscardChoiceView(discord.ui.View):
