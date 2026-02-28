@@ -777,12 +777,35 @@ async def handle_game_over(session: GameSession, result: TurnResult):
 
         await update_game_message(session, content, file=end_file, view=None)
     else:
-        board_file = render_board_file(session)
-        await update_game_message(
-            session,
-            f"📜 {log_text}\n\n💀 **{winner.display_name}** wins! Better luck next time!",
-            file=board_file, view=None
-        )
+        # Winner is bot — show loss end screen to human loser
+        if not loser.is_bot:
+            # Build a loss end screen with 0 XP
+            xp_data = session.engine.calculate_xp(loser)
+            xp_data["total"] = 0  # No XP for losing
+            loser_player_data = load_player_data(loser.user_id)
+            rank_data = {
+                "old_rank": loser_player_data["rank"],
+                "new_rank": loser_player_data["rank"],
+                "ranked_up": False,
+                "old_rank_name": RANK_NAMES.get(loser_player_data["rank"], ""),
+                "new_rank_name": RANK_NAMES.get(loser_player_data["rank"], ""),
+                "total_xp": loser_player_data["xp"],
+            }
+            end_bytes = compositor.render_end_screen(
+                loser, xp_data, rank_data, is_loss=True)
+            end_file = discord.File(io.BytesIO(end_bytes), filename="results.png")
+            await update_game_message(
+                session,
+                f"📜 {log_text}\n\n💀 **{winner.display_name}** wins! Better luck next time!",
+                file=end_file, view=None
+            )
+        else:
+            board_file = render_board_file(session)
+            await update_game_message(
+                session,
+                f"📜 {log_text}\n\n💀 **{winner.display_name}** wins!",
+                file=board_file, view=None
+            )
 
     if not loser.is_bot:
         record_loss(loser.user_id)
