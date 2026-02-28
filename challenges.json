@@ -1,0 +1,172 @@
+[
+  {
+    "id": "glass_cannon",
+    "name": "Glass Cannon",
+    "description": "Massive arcane power, barely any life. Destroy them before they destroy you.",
+    "min_rank": 1,
+    "player": {
+      "life": 10,
+      "sanity": 50,
+      "taint": 0,
+      "arcane": 6,
+      "elder_defense": 0,
+      "hand_size": 5,
+      "madness": null,
+      "deck": null,
+      "actions_per_turn": 1,
+      "turn_limit": null
+    },
+    "bot": {
+      "name": "The Mirror",
+      "rank": 5,
+      "life": 10,
+      "sanity": 50,
+      "taint": 0,
+      "arcane": 6,
+      "elder_defense": 0,
+      "hand_size": 5,
+      "madness": null,
+      "deck": null,
+      "actions_per_turn": 1,
+      "turn_limit": null
+    }
+  },
+  {
+    "id": "madness_run",
+    "name": "The Madness Run",
+    "description": "Both players begin insane. Survive 8 full rounds to claim victory.",
+    "min_rank": 3,
+    "player": {
+      "life": 40,
+      "sanity": -10,
+      "taint": 3,
+      "arcane": 0,
+      "elder_defense": 0,
+      "hand_size": 3,
+      "madness": "Schizophrenia",
+      "deck": null,
+      "actions_per_turn": 1,
+      "turn_limit": 8
+    },
+    "bot": {
+      "name": "The Doppelganger",
+      "rank": 8,
+      "life": 40,
+      "sanity": -10,
+      "taint": 3,
+      "arcane": 0,
+      "elder_defense": 0,
+      "hand_size": 3,
+      "madness": "Xenophobia",
+      "deck": null,
+      "actions_per_turn": 1,
+      "turn_limit": 8
+    }
+  },
+  {
+    "id": "blitz",
+    "name": "Blitz Mode",
+    "description": "Two actions per turn. Chaos reigns — adapt or perish.",
+    "min_rank": 5,
+    "player": {
+      "life": 50,
+      "sanity": 30,
+      "taint": 0,
+      "arcane": 2,
+      "elder_defense": 2,
+      "hand_size": 5,
+      "madness": null,
+      "deck": null,
+      "actions_per_turn": 2,
+      "turn_limit": null
+    },
+    "bot": {
+      "name": "The Blitz Wraith",
+      "rank": 10,
+      "life": 50,
+      "sanity": 30,
+      "taint": 0,
+      "arcane": 2,
+      "elder_defense": 2,
+      "hand_size": 5,
+      "madness": null,
+      "deck": null,
+      "actions_per_turn": 2,
+      "turn_limit": null
+    }
+  },
+  {
+    "id": "purist",
+    "name": "Purist",
+    "description": "No arcane, no elder defense. Pure tactics only. Survive 15 rounds or win outright.",
+    "min_rank": 2,
+    "player": {
+      "life": 40,
+      "sanity": 30,
+      "taint": 0,
+      "arcane": 0,
+      "elder_defense": 0,
+      "hand_size": 5,
+      "madness": null,
+      "deck": [
+        "blast_em", "tommy_gun", "raid", "mi_go_surgery", "discreet_doctor",
+        "essence_of_the_soul", "blackmail", "elder_sign", "arkham_asylum",
+        "byakhee", "curse_of_cthulhu", "dispel", "powder_of_ibn_ghazi",
+        "sacrificial_lamb", "doppelganger"
+      ],
+      "actions_per_turn": 1,
+      "turn_limit": 15
+    },
+    "bot": {
+      "name": "The Strategist",
+      "rank": 6,
+      "life": 40,
+      "sanity": 30,
+      "taint": 0,
+      "arcane": 0,
+      "elder_defense": 0,
+      "hand_size": 5,
+      "madness": null,
+      "deck": [
+        "blast_em", "tommy_gun", "raid", "mi_go_surgery", "discreet_doctor",
+        "essence_of_the_soul", "blackmail", "elder_sign", "arkham_asylum",
+        "byakhee", "curse_of_cthulhu", "dispel", "powder_of_ibn_ghazi",
+        "sacrificial_lamb", "doppelganger"
+      ],
+      "actions_per_turn": 1,
+      "turn_limit": 15
+    }
+  },
+  {
+    "id": "horde",
+    "name": "Against the Horde",
+    "description": "Face an ancient horror with triple the life. You get three actions per turn.",
+    "min_rank": 8,
+    "player": {
+      "life": 40,
+      "sanity": 30,
+      "taint": 0,
+      "arcane": 3,
+      "elder_defense": 1,
+      "hand_size": 5,
+      "madness": null,
+      "deck": null,
+      "actions_per_turn": 3,
+      "turn_limit": null
+    },
+    "bot": {
+      "name": "The Ancient Horror",
+      "rank": 15,
+      "life": 150,
+      "sanity": 30,
+      "taint": 0,
+      "arcane": 8,
+      "elder_defense": 6,
+      "hand_size": 5,
+      "madness": null,
+      "deck": null,
+      "actions_per_turn": 1,
+      "turn_limit": null
+    }
+  }
+]
