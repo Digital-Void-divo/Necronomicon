@@ -20,12 +20,18 @@ from game_engine import GameEngine, TurnResult
 from ai import BotAI
 from image_compositor import ImageCompositor
 from campaign import get_campaign_enemy, get_total_campaign_stages, CampaignEnemy
+from challenge_manager import (
+    get_all_challenges, get_available_challenges, get_challenge_by_id,
+    apply_challenge_config_to_player, build_challenge_bot, ChallengeDefinition,
+)
 from persistence import (
     load_player_data, save_player_data, add_xp,
-    advance_campaign, record_win, record_loss, record_draw
+    advance_campaign, record_win, record_loss, record_draw,
+    mark_challenge_completed, is_challenge_completed,
 )
 from config import CARD_DISPLAY_TIME, RANK_NAMES
 from audio import audio_manager
+from role_manager import assign_rank_role, setup_rank_roles, delete_rank_roles, sync_all_members
 
 
 # === Bot Setup ===
@@ -53,7 +59,8 @@ class GameSession:
     def __init__(self, game_state: GameState, engine: GameEngine,
                  channel_id: int, guild_id: int = None,
                  bot_ai: BotAI = None,
-                 is_campaign: bool = False, is_multiplayer: bool = False):
+                 is_campaign: bool = False, is_multiplayer: bool = False,
+                 is_challenge: bool = False, challenge_id: str = None):
         self.game_state = game_state
         self.engine = engine
         self.channel_id = channel_id
@@ -61,13 +68,15 @@ class GameSession:
         self.bot_ai = bot_ai
         self.is_campaign = is_campaign
         self.is_multiplayer = is_multiplayer
+        self.is_challenge = is_challenge
+        self.challenge_id = challenge_id
         self.message: Optional[discord.Message] = None
         self.p1_avatar_bytes: bytes = None
         self.p2_avatar_bytes: bytes = None
         self.awaiting_blackmail: bool = False
         self.blackmail_target_id: str = None
         self.lock = asyncio.Lock()
-        self.audio_active: bool = False  # True if bot joined VC for this session
+        self.audio_active: bool = False
 
     @property
     def player_ids(self) -> list[str]:
@@ -212,7 +221,7 @@ class MainMenuView(discord.ui.View):
 
     @discord.ui.button(label="Challenge Mode", style=discord.ButtonStyle.secondary, emoji="⚔️", row=0)
     async def challenge_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("Challenge Mode coming soon!", ephemeral=True)
+        await show_challenge_select(interaction)
 
     @discord.ui.button(label="Multiplayer", style=discord.ButtonStyle.primary, emoji="👥", row=0)
     async def multiplayer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -412,6 +421,57 @@ class ChallengeAcceptView(discord.ui.View):
         self.stop()
 
 
+
+# === Challenge Mode UI ===
+
+class ChallengeSelectView(discord.ui.View):
+    """Shows a dropdown of available challenges for the player's rank."""
+
+    def __init__(self, player_rank: int, user_id: str):
+        super().__init__(timeout=120)
+        available = get_available_challenges(player_rank)
+        completed = set()
+        try:
+            from persistence import get_completed_challenges
+            completed = set(get_completed_challenges(user_id))
+        except Exception:
+            pass
+
+        if not available:
+            return
+
+        options = []
+        for ch in available:
+            done = "✅ " if ch.id in completed else ""
+            locked = ch.min_rank > player_rank
+            label = f"{done}{ch.name}" + (f" [Rank {ch.min_rank}+]" if locked else "")
+            options.append(discord.SelectOption(
+                label=label[:100],
+                description=ch.description[:100] if ch.description else "",
+                value=ch.id,
+            ))
+
+        self.add_item(ChallengeSelectDropdown(options))
+
+
+class ChallengeSelectDropdown(discord.ui.Select):
+    def __init__(self, options: list):
+        super().__init__(
+            placeholder="Choose a challenge...",
+            min_values=1, max_values=1,
+            options=options if options else [
+                discord.SelectOption(label="No challenges available", value="none")
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "none":
+            await interaction.response.send_message(
+                "No challenges available at your rank yet.", ephemeral=True)
+            return
+        await start_challenge(interaction, self.values[0])
+
+
 # === Game Flow ===
 
 async def setup_audio_for_session(session: GameSession, member: discord.Member):
@@ -477,6 +537,107 @@ async def start_campaign(interaction: discord.Interaction):
 
     msg = await interaction.followup.send(content=content, file=board_file, view=view, wait=True)
     session.message = msg
+
+
+async def show_challenge_select(interaction: discord.Interaction):
+    """Show the challenge selection dropdown (ephemeral)."""
+    user_id = str(interaction.user.id)
+    if user_in_game(user_id):
+        await interaction.response.send_message(
+            "You already have an active game! Finish or `/forfeit` it first.", ephemeral=True)
+        return
+
+    player_data = load_player_data(user_id)
+    player_rank = player_data["rank"]
+    available = get_available_challenges(player_rank)
+
+    if not available:
+        await interaction.response.send_message(
+            "No challenges are available at your current rank. Keep playing to unlock them!",
+            ephemeral=True)
+        return
+
+    view = ChallengeSelectView(player_rank, user_id)
+    await interaction.response.send_message(
+        "⚔️ **Challenge Mode** — Select a challenge to begin:", view=view, ephemeral=True)
+
+
+async def start_challenge(interaction: discord.Interaction, challenge_id: str):
+    """Start a challenge game from a selection interaction."""
+    user_id = str(interaction.user.id)
+    if user_in_game(user_id):
+        await interaction.response.send_message(
+            "You already have an active game! Finish or `/forfeit` it first.", ephemeral=True)
+        return
+
+    challenge = get_challenge_by_id(challenge_id)
+    if not challenge:
+        await interaction.response.send_message("Challenge not found!", ephemeral=True)
+        return
+
+    user = interaction.user
+    player_data = load_player_data(user_id)
+
+    # Build human player
+    human = Player(
+        user_id=user_id,
+        display_name=user.display_name,
+        avatar_url=str(user.avatar.url) if user.avatar else "",
+        rank=player_data["rank"],
+        is_bot=False,
+    )
+    apply_challenge_config_to_player(
+        human,
+        challenge.player,
+        available_cards=get_cards_for_rank(player_data["rank"]),
+        cards_by_id=CARDS_BY_ID,
+    )
+
+    # Build bot player
+    bot_player = build_challenge_bot(challenge, CARDS_BY_ID)
+
+    # Build game state
+    game_state = GameState(human, bot_player)
+    game_state.game_id = str(uuid.uuid4())
+    game_state.turn_limit = challenge.player.turn_limit  # Player config holds turn limit
+    engine = GameEngine(game_state)
+
+    difficulty = BotAI.get_difficulty_for_rank(challenge.bot.rank)
+    bot_ai = BotAI(difficulty)
+
+    guild_id = interaction.guild.id if interaction.guild else None
+    session = GameSession(
+        game_state=game_state, engine=engine,
+        channel_id=interaction.channel_id, guild_id=guild_id,
+        bot_ai=bot_ai,
+        is_challenge=True, challenge_id=challenge_id,
+    )
+    session.p1_avatar_bytes = await get_avatar_bytes(user)
+    session.p2_avatar_bytes = await get_bot_avatar_bytes()
+    register_session(session)
+
+    if isinstance(user, discord.Member):
+        await setup_audio_for_session(session, user)
+
+    await interaction.response.defer(ephemeral=True)
+    await try_play_audio(session, audio_manager.play_battle_start(guild_id))
+
+    board_file = render_board_file(session)
+    view = GameView(session)
+
+    turn_info = (f" | ⏳ Turn Limit: {challenge.player.turn_limit}" if challenge.player.turn_limit else "")
+    actions_info = (f" | ⚡ {challenge.player.actions_per_turn} actions/turn"
+                    if challenge.player.actions_per_turn > 1 else "")
+    content = (f"⚔️ **Challenge: {challenge.name}**\n"
+               f"*{challenge.description}*\n"
+               f"VS **{challenge.bot.name}** (Rank {challenge.bot.rank})"
+               f"{turn_info}{actions_info}")
+
+    # Send to the channel (not ephemeral) so both can see it
+    channel = bot.get_channel(interaction.channel_id)
+    if channel:
+        msg = await channel.send(content=content, file=board_file, view=view)
+        session.message = msg
 
 
 async def create_multiplayer_lobby(interaction: discord.Interaction):
@@ -785,12 +946,26 @@ async def handle_game_over(session: GameSession, result: TurnResult):
         if session.is_campaign:
             advance_campaign(winner.user_id)
 
+        if session.is_challenge and session.challenge_id:
+            mark_challenge_completed(winner.user_id, session.challenge_id)
+
+        # Assign rank role — on rank-up or first time regardless
+        if session.guild_id:
+            guild = bot.get_guild(session.guild_id)
+            if guild:
+                try:
+                    member = await guild.fetch_member(int(winner.user_id))
+                    await assign_rank_role(member, rank_data["new_rank"])
+                except Exception as e:
+                    print(f"[RoleManager] Could not assign role to {winner.user_id}: {e}")
+
         end_bytes = compositor.render_end_screen(winner, xp_data, rank_data)
         end_file = discord.File(io.BytesIO(end_bytes), filename="results.png")
 
         content = f"📜 {log_text}\n\n🏆 **{winner.display_name}** is victorious!"
         if rank_data["ranked_up"]:
-            content += f"\n🎉 Ranked up to **{rank_data['new_rank']}- {rank_data['new_rank_name']}**!"
+            content += (f"\n🎉 Ranked up to **Rank {rank_data['new_rank']} —"
+                        f" {rank_data['new_rank_name']}**!")
 
         await update_game_message(session, content, file=end_file, view=None)
     else:
@@ -860,6 +1035,11 @@ async def play_command(interaction: discord.Interaction):
 @bot.tree.command(name="campaign", description="Start your next campaign battle")
 async def campaign_command(interaction: discord.Interaction):
     await start_campaign(interaction)
+
+
+@bot.tree.command(name="challenges", description="Browse and start challenge mode scenarios")
+async def challenges_command(interaction: discord.Interaction):
+    await show_challenge_select(interaction)
 
 
 @bot.tree.command(name="challenge", description="Challenge another player")
@@ -966,6 +1146,100 @@ async def cardlist_command(interaction: discord.Interaction):
     await interaction.response.send_message(chunks[0], ephemeral=True)
     for chunk in chunks[1:]:
         await interaction.followup.send(chunk, ephemeral=True)
+
+
+
+# === Role Management Commands ===
+
+@bot.tree.command(name="setup_roles", description="[Admin] Create all Necronomicon rank roles in this server")
+@app_commands.default_permissions(manage_roles=True)
+async def setup_roles_command(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    created, skipped = await setup_rank_roles(interaction.guild)
+
+    lines = []
+    if created:
+        lines.append(f"✅ **Created ({len(created)}):** " + ", ".join(created))
+    if skipped:
+        lines.append(f"⏭️ **Already existed / skipped ({len(skipped)}):** " + ", ".join(skipped))
+    if not created and not skipped:
+        lines.append("Nothing to do — no rank roles are defined.")
+
+    lines.append(
+        "\n**Next step:** In Server Settings → Roles, drag the bot's role **above** "
+        "all the Necronomicon rank roles so it can assign them."
+    )
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="reset_roles", description="[Admin] Delete all Necronomicon rank roles and recreate them")
+@app_commands.default_permissions(manage_roles=True)
+async def reset_roles_command(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    deleted, failed_del = await delete_rank_roles(interaction.guild)
+    created, skipped = await setup_rank_roles(interaction.guild)
+
+    lines = [f"🗑️ Deleted {len(deleted)} old role(s)."]
+    if failed_del:
+        lines.append(f"⚠️ Could not delete: " + ", ".join(failed_del))
+    lines.append(f"✅ Created {len(created)} role(s).")
+    if skipped:
+        lines.append(f"⏭️ Skipped: " + ", ".join(skipped))
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="sync_role", description="Fix your Necronomicon rank role if it looks wrong")
+async def sync_role_command(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+
+    user_id = str(interaction.user.id)
+    data = load_player_data(user_id)
+    rank = data.get("rank", 1)
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        member = await interaction.guild.fetch_member(interaction.user.id)
+        success, msg = await assign_rank_role(member, rank)
+        rank_name = RANK_NAMES.get(rank, f"Rank {rank}")
+        if success:
+            await interaction.followup.send(
+                f"✅ Role synced — you are **Rank {rank}: {rank_name}**.", ephemeral=True)
+        else:
+            await interaction.followup.send(f"⚠️ Could not sync role: {msg}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Error syncing role: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="sync_all_roles", description="[Admin] Sync Necronomicon rank roles for every server member")
+@app_commands.default_permissions(manage_roles=True)
+async def sync_all_roles_command(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    result = await sync_all_members(interaction.guild, load_player_data)
+
+    await interaction.followup.send(
+        f"✅ Role sync complete for **{result['total']}** members:\n"
+        f"  • Updated: **{result['updated']}**\n"
+        f"  • Already correct: **{result['already_correct']}**\n"
+        f"  • No game data: **{result['no_data']}**\n"
+        f"  • Failed: **{result['failed']}**",
+        ephemeral=True
+    )
 
 
 # === Bot Events ===
