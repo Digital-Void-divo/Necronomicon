@@ -69,6 +69,10 @@ class Player:
         # Monster
         self.monster: Optional[Monster] = None
 
+        # Multi-action turn support
+        self.actions_per_turn: int = 1
+        self.actions_remaining: int = 1
+
         # Combat tracking for XP
         self.damage_dealt = 0
         self.damage_received = 0
@@ -330,6 +334,7 @@ class GameState:
         self.game_over = False
         self.winner: Optional[Player] = None
         self.is_draw = False
+        self.turn_limit: Optional[int] = None   # Max full rounds (both players act) before loser declared
         self.log: list[str] = []
         self.last_played_card: Optional[Card] = None
         self.last_card_player: Optional[Player] = None
@@ -347,6 +352,8 @@ class GameState:
         """Switch to the other player's turn."""
         self.current_player = self.waiting_player
         self.turn_number += 1
+        # Reset action budget for the player whose turn it now is
+        self.current_player.actions_remaining = self.current_player.actions_per_turn
 
     def check_game_over(self) -> list[str]:
         """Check win/loss/draw conditions."""
@@ -371,6 +378,19 @@ class GameState:
                 self.game_over = True
                 self.is_draw = True
                 messages.append("📚 Both players have exhausted their decks! It's a draw!")
+
+        # Turn limit — a full round = both players have acted once (2 switch_turn calls)
+        if not self.game_over and self.turn_limit is not None:
+            full_rounds = self.turn_number // 2
+            if full_rounds >= self.turn_limit:
+                self.game_over = True
+                loser = self.current_player
+                winner = self.get_opponent(loser)
+                self.winner = winner
+                messages.append(
+                    f"⏳ Turn limit of {self.turn_limit} rounds reached! "
+                    f"{loser.display_name} ran out of time!")
+                messages.append(f"🏆 {winner.display_name} wins!")
 
         return messages
 
