@@ -13,6 +13,7 @@ Drop MP3 files into assets/audio/ with these names:
 """
 
 import os
+import shutil
 import asyncio
 from typing import Optional
 
@@ -25,6 +26,42 @@ from config import (
     PHYSICAL_ATTACK_CARDS, MAGICAL_ATTACK_CARDS, NON_ATTACK_CARDS,
     SUMMON_CARDS,
 )
+
+
+# ── FFmpeg detection ──────────────────────────────────────────────────────────
+# Railway / nixpacks installs ffmpeg via apt but it may not be on PATH at import
+# time.  We search common locations so audio works without manual PATH edits.
+
+_FFMPEG_SEARCH_PATHS = [
+    "/usr/bin/ffmpeg",
+    "/usr/local/bin/ffmpeg",
+    "/nix/store",        # nixpacks sometimes puts binaries here (resolved below)
+    "/app/.apt/usr/bin/ffmpeg",   # Heroku-style buildpack path
+]
+
+def _find_ffmpeg() -> Optional[str]:
+    """Return the absolute path to ffmpeg, or None if not found."""
+    # 1. Already on PATH?
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    # 2. Known fixed locations
+    for path in _FFMPEG_SEARCH_PATHS:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+FFMPEG_PATH: Optional[str] = _find_ffmpeg()
+
+if FFMPEG_PATH:
+    print(f"[Audio] ffmpeg found: {FFMPEG_PATH}")
+else:
+    print(
+        "[Audio] WARNING: ffmpeg not found. Voice audio will be silently disabled.\n"
+        "  • On Railway: ensure nixpacks.toml contains aptPkgs = [\"ffmpeg\"] and redeploy.\n"
+        "  • On Heroku: add the FFmpeg buildpack before the Python buildpack.\n"
+        "  • Locally: install ffmpeg and ensure it is on your PATH."
+    )
 
 
 class AudioManager:
@@ -85,23 +122,25 @@ class AudioManager:
         if not self.is_audio_enabled(guild_id):
             return
 
+        if not FFMPEG_PATH:
+            return  # ffmpeg not available — silent no-op
+
         vc = self.voice_clients.get(guild_id)
         if not vc or not vc.is_connected():
             return
 
-        full_path = audio_path
-        if not os.path.exists(full_path):
+        if not os.path.exists(audio_path):
             return
 
-        # Wait for any currently playing audio to finish
+        # Stop currently playing audio
         if vc.is_playing():
             vc.stop()
 
         try:
-            source = discord.FFmpegPCMAudio(full_path)
+            source = discord.FFmpegPCMAudio(audio_path, executable=FFMPEG_PATH)
             vc.play(source)
         except Exception as e:
-            print(f"Error playing audio {full_path}: {e}")
+            print(f"[Audio] Error playing {audio_path}: {e}")
 
     async def play_menu_start(self, guild_id: int):
         await self.play_sound(guild_id, AUDIO_MENU_START)
