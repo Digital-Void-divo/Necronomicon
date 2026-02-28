@@ -6,8 +6,10 @@ One active game per player. Audio plays in voice if user is in VC.
 
 import os
 import asyncio
+import time
 import uuid
 import io
+import random
 from typing import Optional
 
 import discord
@@ -27,9 +29,9 @@ from challenge_manager import (
 from persistence import (
     load_player_data, save_player_data, add_xp,
     advance_campaign, record_win, record_loss, record_draw,
-    mark_challenge_completed, is_challenge_completed,
+    mark_challenge_completed, is_challenge_completed, get_all_player_data,
 )
-from config import CARD_DISPLAY_TIME, RANK_NAMES
+from config import CARD_DISPLAY_TIME, RANK_NAMES, ANNOUNCEMENT_CHANNEL_ID
 from audio import audio_manager
 from role_manager import assign_rank_role, setup_rank_roles, delete_rank_roles, sync_all_members
 from guide import send_guide
@@ -78,6 +80,12 @@ class GameSession:
         self.blackmail_target_id: str = None
         self.lock = asyncio.Lock()
         self.audio_active: bool = False
+        # Turn timer
+        self.turn_start_time: float = 0.0
+        self.turn_timer_task: Optional[asyncio.Task] = None
+        # Rematch metadata (populated at game start)
+        self.rematch_p1_id: Optional[str] = None   # discord user id str
+        self.rematch_p2_id: Optional[str] = None   # None for bot games
 
     @property
     def player_ids(self) -> list[str]:
@@ -217,31 +225,155 @@ async def try_play_audio(session: GameSession, coro):
             coro.close()
 
 
+
+TURN_TIMER_SECONDS = 180  # 3 minutes
+
+
+def start_turn_timer(session: "GameSession"):
+    """Cancel any running timer and start a fresh one for the current player's turn."""
+    cancel_turn_timer(session)
+    session.turn_start_time = time.time()
+    session.turn_timer_task = asyncio.create_task(_turn_timeout(session))
+
+
+def cancel_turn_timer(session: "GameSession"):
+    """Cancel the running timer task without forfeiting."""
+    if session.turn_timer_task and not session.turn_timer_task.done():
+        session.turn_timer_task.cancel()
+    session.turn_timer_task = None
+
+
+async def _turn_timeout(session: "GameSession"):
+    """Auto-forfeit the current player after TURN_TIMER_SECONDS."""
+    try:
+        await asyncio.sleep(TURN_TIMER_SECONDS)
+    except asyncio.CancelledError:
+        return
+
+    gs = session.game_state
+    if gs.game_over:
+        return
+
+    timed_out = gs.current_player
+    gs.winner = gs.get_opponent(timed_out)
+    gs.game_over = True
+
+    result = TurnResult()
+    result.game_over = True
+    result.messages.append(f"⏰ **{timed_out.display_name}** ran out of time (3 min limit)!")
+    result.game_over_messages.append(f"🏆 **{gs.winner.display_name}** wins by timeout!")
+    result.messages.extend(result.game_over_messages)
+
+    await handle_game_over(session, result)
+
+
+async def post_announcement(content: str):
+    """Post a message to the configured announcement channel (fire-and-forget)."""
+    if not ANNOUNCEMENT_CHANNEL_ID:
+        return
+    channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
+    if channel:
+        try:
+            await channel.send(content)
+        except Exception as e:
+            print(f"[Announce] Could not post: {e}")
+
+
+# === Taunt Strings ===
+
+_TAUNTS = [
+    "Is that all you've got? My grandmother summons stronger Shoggoths.",
+    "The stars are right... and they're laughing at you.",
+    "Ph'nglui mglw'nafh... in your face.",
+    "Your Elder Defense couldn't stop a nervous cultist.",
+    "Ia! Ia! Your strategy is adorable.",
+    "I've seen scarier things in Dunwich, and that's saying something.",
+    "You play cards like someone who's never read the Necronomicon.",
+]
+
+_CONGRATULATES = [
+    "Hm. That was actually a decent move. Don't let it go to your head.",
+    "Lucky draw. Enjoy it while it lasts.",
+    "I'll admit, I didn't see that coming. Annoying.",
+    "Not bad... for someone who still has their sanity.",
+    "The Old Ones smiled on you that turn. Suspicious.",
+    "Fine. You earned that one.",
+    "Begrudging respect. Don't push it.",
+]
+
+_BEGS = [
+    "O—okay, let's not be hasty here...",
+    "I have a family! ...of cultists. But still.",
+    "Please. I'll tell you where the Elder Sign is!",
+    "Wait wait wait — mercy? Mercy is a thing, right?",
+    "The Necronomicon says something about mercy... probably.",
+    "I yield! Temporarily! For strategic reasons!",
+    "You wouldn't strike down someone this close to a breakdown, would you?",
+]
+
+_GOOD_GAMES = [
+    "Good game. The stars aligned for one of us today.",
+    "Well played. May your sanity recover... eventually.",
+    "A worthy clash. The Old Ones are satisfied.",
+    "You've earned your Taint. Wear it proudly.",
+    "Respects from the abyss. Good game.",
+    "That was a proper summoning contest. GG.",
+    "The Ancient Ones observed this battle with mild interest. GG.",
+]
+
+_INSANE_GIBBERISH = [
+    "Ghlk— the COLORS they SPIRAL they SPIRAL—",
+    "Ia! Ia! Fnord fhtagn blblblbl!!",
+    "The walls are breathing and so am I and you ARE the wall—",
+    "Ph'nglui— wait who am I— WHO ARE YOU—",
+    "YyyyYYYYYYAAAAA the geometry— it's ALL WRONG—",
+    "Tekeli-li tekeli-li TEKELI-LI!!",
+    "I can see the strings. You're all STRINGS. Everything is STRINGS.",
+    "The card! It SPOKE to me! It said things about YOU!",
+]
+
+
 # === Discord UI Views ===
 
 
 class MainMenuView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, owner_id: int):
         super().__init__(timeout=120)
+        self.owner_id = owner_id
+
+    async def _owner_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Open your own menu with `/play`.", ephemeral=True)
+            return False
+        return True
 
     @discord.ui.button(label="Campaign", style=discord.ButtonStyle.danger, emoji="📖", row=0)
     async def campaign_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._owner_check(interaction):
+            return
         await start_campaign(interaction)
 
-    @discord.ui.button(label="Challenge Mode", style=discord.ButtonStyle.secondary, emoji="⚔️", row=0)
+    @discord.ui.button(label="Challenges", style=discord.ButtonStyle.secondary, emoji="⚔️", row=0)
     async def challenge_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._owner_check(interaction):
+            return
         await show_challenge_select(interaction)
 
     @discord.ui.button(label="Multiplayer", style=discord.ButtonStyle.primary, emoji="👥", row=0)
     async def multiplayer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._owner_check(interaction):
+            return
         await create_multiplayer_lobby(interaction)
 
     @discord.ui.button(label="Guide", style=discord.ButtonStyle.secondary, emoji="❓", row=0)
     async def guide_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await send_guide(interaction)
+        await send_guide(interaction)  # Anyone may open the guide
 
     @discord.ui.button(label="Exit", style=discord.ButtonStyle.secondary, emoji="✖️", row=0)
     async def exit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._owner_check(interaction):
+            return
         await interaction.message.delete()
         self.stop()
 
@@ -261,10 +393,17 @@ class GameView(discord.ui.View):
             can_play, _ = current.can_play_card(i)
             self.add_item(PlayCardButton(session, i, can_play))
 
-        # Row 1: utility buttons
+        # Row 1: View Hand | Discard | Check Timer | Guide
         self.add_item(ViewHandButton(session))
         self.add_item(DiscardSelectButton(session))
+        self.add_item(CheckTimerButton(session))
         self.add_item(InGameGuideButton())
+
+        # Row 2: Taunt buttons (available to all players in this game, not turn-locked)
+        self.add_item(TauntButton(session, "taunt"))
+        self.add_item(TauntButton(session, "congratulate"))
+        self.add_item(TauntButton(session, "beg"))
+        self.add_item(TauntButton(session, "gg"))
 
 
 class ViewHandButton(discord.ui.Button):
@@ -337,6 +476,64 @@ class InGameGuideButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         await send_guide(interaction)
+
+
+class CheckTimerButton(discord.ui.Button):
+    def __init__(self, session: GameSession):
+        super().__init__(label="⏱ Timer", style=discord.ButtonStyle.secondary, row=1)
+        self.session = session
+
+    async def callback(self, interaction: discord.Interaction):
+        gs = self.session.game_state
+        if self.session.turn_start_time == 0.0:
+            await interaction.response.send_message("No timer running.", ephemeral=True)
+            return
+        elapsed = time.time() - self.session.turn_start_time
+        remaining = max(0.0, TURN_TIMER_SECONDS - elapsed)
+        mins, secs = divmod(int(remaining), 60)
+        player_name = gs.current_player.display_name
+        if remaining <= 0:
+            msg = f"⏰ **{player_name}**'s time is up!"
+        else:
+            msg = f"⏱ **{player_name}** has **{mins}:{secs:02d}** remaining."
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
+_TAUNT_CONFIG = {
+    "taunt":       ("😈 Taunt",       discord.ButtonStyle.danger,     _TAUNTS),
+    "congratulate":("👏 Congrats",    discord.ButtonStyle.success,    _CONGRATULATES),
+    "beg":         ("🙏 Beg",         discord.ButtonStyle.secondary,  _BEGS),
+    "gg":          ("🤝 Good Game",   discord.ButtonStyle.secondary,  _GOOD_GAMES),
+}
+
+
+class TauntButton(discord.ui.Button):
+    def __init__(self, session: GameSession, taunt_type: str):
+        label, style, _ = _TAUNT_CONFIG[taunt_type]
+        super().__init__(label=label, style=style, row=2)
+        self.session = session
+        self.taunt_type = taunt_type
+
+    async def callback(self, interaction: discord.Interaction):
+        gs = self.session.game_state
+        user_id = str(interaction.user.id)
+
+        # Only players in this game may use taunts
+        if user_id not in (gs.player1.user_id, gs.player2.user_id):
+            await interaction.response.send_message(
+                "You're not in this game!", ephemeral=True)
+            return
+
+        sender = gs.player1 if user_id == gs.player1.user_id else gs.player2
+        _, _, lines = _TAUNT_CONFIG[self.taunt_type]
+
+        if sender.is_insane:
+            text = random.choice(_INSANE_GIBBERISH)
+        else:
+            text = random.choice(lines)
+
+        await interaction.response.send_message(
+            f"**{sender.display_name}:** *{text}*")
 
 
 class DiscardChoiceView(discord.ui.View):
@@ -431,6 +628,58 @@ class ChallengeAcceptView(discord.ui.View):
 
 
 
+class RematchView(discord.ui.View):
+    """Shown after a game ends — lets the player(s) immediately replay."""
+
+    def __init__(self, session: GameSession):
+        super().__init__(timeout=120)
+        self.session = session
+
+    @discord.ui.button(label="🔄 Rematch", style=discord.ButtonStyle.primary)
+    async def rematch_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = str(interaction.user.id)
+        s = self.session
+
+        # Only original participants may rematch
+        valid_ids = [i for i in [s.rematch_p1_id, s.rematch_p2_id] if i]
+        if uid not in valid_ids:
+            await interaction.response.send_message(
+                "You weren't in this game.", ephemeral=True)
+            return
+
+        if user_in_game(uid):
+            await interaction.response.send_message(
+                "You already have an active game!", ephemeral=True)
+            return
+
+        self.disable_all_items()
+        await interaction.message.edit(view=self)
+
+        if s.is_campaign:
+            await start_campaign(interaction)
+        elif s.is_challenge and s.challenge_id:
+            await start_challenge(interaction, s.challenge_id)
+        elif s.is_multiplayer and s.rematch_p2_id:
+            # For multiplayer the second human must also not be in a game
+            other_id = s.rematch_p2_id if uid == s.rematch_p1_id else s.rematch_p1_id
+            if user_in_game(other_id):
+                await interaction.response.send_message(
+                    "Your opponent is already in another game.", ephemeral=True)
+                return
+            # Re-use the direct challenge flow with original host = p1
+            view = ChallengeAcceptView(int(s.rematch_p1_id), int(s.rematch_p2_id))
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    f"🔄 **{interaction.user.display_name}** wants a rematch! "
+                    f"<@{other_id}> — accept?", view=view)
+            else:
+                await interaction.response.send_message(
+                    f"🔄 **{interaction.user.display_name}** wants a rematch! "
+                    f"<@{other_id}> — accept?", view=view)
+        else:
+            await start_campaign(interaction)
+
+
 # === Challenge Mode UI ===
 
 class ChallengeSelectView(discord.ui.View):
@@ -483,8 +732,14 @@ class ChallengeSelectDropdown(discord.ui.Select):
 
 # === Game Flow ===
 
+# Set of user IDs who have explicitly disabled audio via /audio off
+_audio_disabled_users: set[int] = set()
+
+
 async def setup_audio_for_session(session: GameSession, member: discord.Member):
-    """If the member is in a voice channel, join it and mark audio as active."""
+    """If the member is in a voice channel and hasn't disabled audio, join and mark active."""
+    if member.id in _audio_disabled_users:
+        return
     if member.voice and member.voice.channel:
         vc = await audio_manager.try_join_voice(member)
         if vc:
@@ -526,6 +781,7 @@ async def start_campaign(interaction: discord.Interaction):
     session.p1_avatar_bytes = await get_avatar_bytes(user)
     # Use the bot's own avatar for campaign enemies
     session.p2_avatar_bytes = await get_bot_avatar_bytes()
+    session.rematch_p1_id = user_id
     register_session(session)
 
     # Try to join voice channel for audio
@@ -546,6 +802,7 @@ async def start_campaign(interaction: discord.Interaction):
 
     msg = await interaction.followup.send(content=content, file=board_file, view=view, wait=True)
     session.message = msg
+    start_turn_timer(session)
 
 
 async def show_challenge_select(interaction: discord.Interaction):
@@ -623,6 +880,7 @@ async def start_challenge(interaction: discord.Interaction, challenge_id: str):
     )
     session.p1_avatar_bytes = await get_avatar_bytes(user)
     session.p2_avatar_bytes = await get_bot_avatar_bytes()
+    session.rematch_p1_id = user_id
     register_session(session)
 
     if isinstance(user, discord.Member):
@@ -647,6 +905,7 @@ async def start_challenge(interaction: discord.Interaction, challenge_id: str):
     if channel:
         msg = await channel.send(content=content, file=board_file, view=view)
         session.message = msg
+        start_turn_timer(session)
 
 
 async def create_multiplayer_lobby(interaction: discord.Interaction):
@@ -697,6 +956,8 @@ async def start_multiplayer_game(interaction: discord.Interaction, host_id: int)
     )
     session.p1_avatar_bytes = await get_avatar_bytes(host)
     session.p2_avatar_bytes = await get_avatar_bytes(challenger)
+    session.rematch_p1_id = str(host.id)
+    session.rematch_p2_id = str(challenger.id)
     register_session(session)
 
     # Try to join voice
@@ -712,6 +973,7 @@ async def start_multiplayer_game(interaction: discord.Interaction, host_id: int)
     content = f"⚔️ **{host.display_name}** vs **{challenger.display_name}**"
     msg = await interaction.followup.send(content=content, file=board_file, view=view, wait=True)
     session.message = msg
+    start_turn_timer(session)
 
 
 async def handle_play_card(interaction: discord.Interaction, session: GameSession, card_index: int):
@@ -821,10 +1083,12 @@ async def post_turn_result(session: GameSession, result: TurnResult):
     log_text = "\n".join(result.messages[-10:])
 
     if result.game_over:
+        cancel_turn_timer(session)
         await handle_game_over(session, result)
         return
 
     if gs.current_player.is_bot and session.bot_ai:
+        cancel_turn_timer(session)  # Bot turns don't need a timer
         board_file = render_board_file(session)
         await update_game_message(
             session,
@@ -834,6 +1098,7 @@ async def post_turn_result(session: GameSession, result: TurnResult):
         await asyncio.sleep(2)
         await handle_bot_turn(session)
     else:
+        start_turn_timer(session)  # Fresh 3-minute clock for the human
         board_file = render_board_file(session)
         view = GameView(session)
         await update_game_message(
@@ -922,6 +1187,10 @@ async def _check_insanity_audio(session: GameSession, result: TurnResult):
 async def handle_game_over(session: GameSession, result: TurnResult):
     gs = session.game_state
     log_text = "\n".join(result.messages)
+    rematch_view = RematchView(session)
+
+    # Cancel the turn timer — game is over
+    cancel_turn_timer(session)
 
     # Play battle end audio
     await try_play_audio(session,
@@ -931,14 +1200,13 @@ async def handle_game_over(session: GameSession, result: TurnResult):
         board_file = render_board_file(session)
         await update_game_message(
             session, f"📜 {log_text}\n\n🤝 **DRAW!**",
-            file=board_file, view=None
+            file=board_file, view=rematch_view
         )
         for p in [gs.player1, gs.player2]:
             if not p.is_bot:
                 record_draw(p.user_id)
         unregister_session(session)
 
-        # Disconnect from voice after a delay
         if session.audio_active and session.guild_id:
             await asyncio.sleep(5)
             await audio_manager.disconnect(session.guild_id)
@@ -958,7 +1226,7 @@ async def handle_game_over(session: GameSession, result: TurnResult):
         if session.is_challenge and session.challenge_id:
             mark_challenge_completed(winner.user_id, session.challenge_id)
 
-        # Assign rank role — on rank-up or first time regardless
+        # Assign rank role
         if session.guild_id:
             guild = bot.get_guild(session.guild_id)
             if guild:
@@ -973,16 +1241,20 @@ async def handle_game_over(session: GameSession, result: TurnResult):
 
         content = f"📜 {log_text}\n\n🏆 **{winner.display_name}** is victorious!"
         if rank_data["ranked_up"]:
-            content += (f"\n🎉 Ranked up to **Rank {rank_data['new_rank']} —"
-                        f" {rank_data['new_rank_name']}**!")
+            new_rank_name = rank_data["new_rank_name"]
+            new_rank_num  = rank_data["new_rank"]
+            content += f"\n🎉 Ranked up to **Rank {new_rank_num} — {new_rank_name}**!"
+            await post_announcement(
+                f"🎉 <@{winner.user_id}> has ranked up to **Rank {new_rank_num} — {new_rank_name}**!"
+            )
 
-        await update_game_message(session, content, file=end_file, view=None)
+        await update_game_message(session, content, file=end_file, view=rematch_view)
+
     else:
-        # Winner is bot — show loss end screen to human loser
+        # Winner is bot — human loser
         if not loser.is_bot:
-            # Build a loss end screen with 0 XP
             xp_data = session.engine.calculate_xp(loser)
-            xp_data["total"] = 0  # No XP for losing
+            xp_data["total"] = 0
             loser_player_data = load_player_data(loser.user_id)
             rank_data = {
                 "old_rank": loser_player_data["rank"],
@@ -992,20 +1264,19 @@ async def handle_game_over(session: GameSession, result: TurnResult):
                 "new_rank_name": RANK_NAMES.get(loser_player_data["rank"], ""),
                 "total_xp": loser_player_data["xp"],
             }
-            end_bytes = compositor.render_end_screen(
-                loser, xp_data, rank_data, is_loss=True)
+            end_bytes = compositor.render_end_screen(loser, xp_data, rank_data, is_loss=True)
             end_file = discord.File(io.BytesIO(end_bytes), filename="results.png")
             await update_game_message(
                 session,
                 f"📜 {log_text}\n\n💀 **{winner.display_name}** wins! Better luck next time!",
-                file=end_file, view=None
+                file=end_file, view=rematch_view
             )
         else:
             board_file = render_board_file(session)
             await update_game_message(
                 session,
                 f"📜 {log_text}\n\n💀 **{winner.display_name}** wins!",
-                file=board_file, view=None
+                file=board_file, view=rematch_view
             )
 
     if not loser.is_bot:
@@ -1013,7 +1284,6 @@ async def handle_game_over(session: GameSession, result: TurnResult):
 
     unregister_session(session)
 
-    # Disconnect from voice after a delay
     if session.audio_active and session.guild_id:
         await asyncio.sleep(5)
         await audio_manager.disconnect(session.guild_id)
@@ -1037,7 +1307,7 @@ async def play_command(interaction: discord.Interaction):
 
     menu_bytes = compositor.render_menu()
     menu_file = discord.File(io.BytesIO(menu_bytes), filename="menu.png")
-    view = MainMenuView()
+    view = MainMenuView(owner_id=interaction.user.id)
     await interaction.response.send_message(file=menu_file, view=view)
 
 
@@ -1162,6 +1432,60 @@ async def cardlist_command(interaction: discord.Interaction):
     await interaction.response.send_message(chunks[0], ephemeral=True)
     for chunk in chunks[1:]:
         await interaction.followup.send(chunk, ephemeral=True)
+
+
+@bot.tree.command(name="leaderboard", description="View the top Necronomicon players by XP")
+@app_commands.describe(top="How many entries to show (default 10, max 25)")
+async def leaderboard_command(interaction: discord.Interaction, top: int = 10):
+    top = max(1, min(top, 25))
+    all_data = get_all_player_data()
+
+    # Sort by XP descending
+    ranked = sorted(all_data, key=lambda d: d["xp"], reverse=True)[:top]
+
+    if not ranked:
+        await interaction.response.send_message("No player data yet!", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="📖 Necronomicon Leaderboard",
+        colour=discord.Colour.from_rgb(160, 30, 30),
+    )
+
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = []
+    for i, data in enumerate(ranked, 1):
+        medal = medals.get(i, f"**{i}.**")
+        rank_name = RANK_NAMES.get(data["rank"], f"Rank {data['rank']}")
+        lines.append(
+            f"{medal} <@{data['user_id']}> — "
+            f"Rank {data['rank']} ({rank_name}) · {data['xp']:,} XP · "
+            f"{data['wins']}W/{data['losses']}L"
+        )
+
+    embed.description = "\n".join(lines)
+    embed.set_footer(text=f"Showing top {len(ranked)} players")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="audio", description="Toggle voice-channel audio on or off for your next game")
+@app_commands.describe(setting="on or off")
+@app_commands.choices(setting=[
+    app_commands.Choice(name="on",  value="on"),
+    app_commands.Choice(name="off", value="off"),
+])
+async def audio_command(interaction: discord.Interaction, setting: str):
+    # Store preference per-user in memory for the session
+    # (A persistent per-user flag can be added to player data if desired later)
+    uid = interaction.user.id
+    if setting == "off":
+        _audio_disabled_users.add(uid)
+        await interaction.response.send_message(
+            "🔇 Audio disabled — your next game will be silent.", ephemeral=True)
+    else:
+        _audio_disabled_users.discard(uid)
+        await interaction.response.send_message(
+            "🔊 Audio enabled — the Old Ones will be heard.", ephemeral=True)
 
 
 
