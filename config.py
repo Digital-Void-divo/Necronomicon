@@ -84,6 +84,13 @@ MONSTER_IMAGE_PATH_TEMPLATE = f"{ASSETS_DIR}/monsters/{{monster_id}}.png"
 
 PLAYER_DATA_DIR = "data/players"
 
+# === Announcement Channel ===
+# Set ANNOUNCEMENT_CHANNEL_ID as a Railway/environment variable.
+# The bot will post rank-up and notable game events here.
+# Leave unset (or 0) to disable announcements.
+import os as _os
+ANNOUNCEMENT_CHANNEL_ID: int = int(_os.environ.get("ANNOUNCEMENT_CHANNEL_ID", "0") or "0")
+
 # === Card Resolution Display Time (seconds) ===
 CARD_DISPLAY_TIME = 3
 
