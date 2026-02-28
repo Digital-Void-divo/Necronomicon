@@ -199,12 +199,22 @@ async def update_game_message(session: GameSession, content: str,
 
 
 async def try_play_audio(session: GameSession, coro):
-    """Play audio if the session has an active voice connection."""
+    """Play audio if the session has an active voice connection.
+
+    Pass a coroutine (already created by calling the async method).
+    If audio is inactive the coroutine is closed immediately to suppress
+    the 'coroutine was never awaited' RuntimeWarning.
+    """
+    import inspect
     if session.audio_active and session.guild_id:
         try:
             await coro
         except Exception as e:
             print(f"Audio error: {e}")
+    else:
+        # Coroutine was created by the caller but won't be awaited — close it cleanly
+        if inspect.iscoroutine(coro):
+            coro.close()
 
 
 # === Discord UI Views ===
