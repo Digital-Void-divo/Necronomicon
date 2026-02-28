@@ -1,20 +1,47 @@
 """Necronomicon Card Game - Image Compositor
 
 Renders game state into composite board images using Pillow.
-Layout is designed to match the original Flash game at 860x540.
+Auto-detects the actual board_bg.png resolution and proportionally
+scales every coordinate from the 1536×1024 reference defined in
+config.py, so the same code works at any board size.
+
+IMPORTANT: The board background already contains baked-in artwork for
+"Life", "Sanity" labels and the three stat-bar symbols (Taint, Arcane,
+Elder).  This compositor only draws *numbers* and *dynamic elements*
+on top — it never re-draws those static labels.
 """
 
 import os
 import io
 from PIL import Image, ImageDraw, ImageFont
 from typing import Optional
+
 from models import Player, GameState
 from config import (
-    BOARD_WIDTH, BOARD_HEIGHT, ASSETS_DIR, FONT_PATH,
+    ASSETS_DIR, FONT_PATH,
     BOARD_BG_PATH, CARD_BACK_PATH, BOOK_CLOSED_PATH, BOOK_OPEN_PATH,
-    TAINT_SYMBOL_PATH, ARCANE_SYMBOL_PATH, ELDER_SYMBOL_PATH,
     CARD_IMAGE_PATH_TEMPLATE, MONSTER_IMAGE_PATH_TEMPLATE,
-    MENU_BG_PATH, END_SCREEN_BG_PATH,
+    MENU_BG_PATH, END_SCREEN_BG_PATH, HAND_BG_PATH,
+    BOARD_REF_W, BOARD_REF_H,
+    # Top player
+    TOP_CARD_SLOTS, TOP_LIFE_BOX, TOP_SANITY_BOX,
+    TOP_AVATAR_BOX, TOP_NAME_POS, TOP_RANK_POS,
+    TOP_TAINT_NUM_POS, TOP_ARCANE_NUM_POS, TOP_ELDER_NUM_POS,
+    TOP_INVULN_POS, TOP_MADNESS_POS,
+    TOP_MONSTER_POS, TOP_MONSTER_SIZE,
+    # Centre
+    BOOK_CLOSED_POS, BOOK_CLOSED_SIZE, BOOK_OPEN_POS, BOOK_OPEN_SIZE,
+    CARD_DISPLAY_LEFT_POS, CARD_DISPLAY_LEFT_SIZE,
+    CARD_DISPLAY_RIGHT_POS, CARD_DISPLAY_RIGHT_SIZE,
+    # Bottom player
+    BOTTOM_CARD_SLOTS, BOTTOM_LIFE_BOX, BOTTOM_SANITY_BOX,
+    BOTTOM_AVATAR_BOX, BOTTOM_NAME_POS, BOTTOM_RANK_POS,
+    BOTTOM_TAINT_NUM_POS, BOTTOM_ARCANE_NUM_POS, BOTTOM_ELDER_NUM_POS,
+    BOTTOM_INVULN_POS, BOTTOM_MADNESS_POS,
+    BOTTOM_MONSTER_POS, BOTTOM_MONSTER_SIZE,
+    # Font sizes
+    FONT_SIZE_STAT_VALUE, FONT_SIZE_RANK, FONT_SIZE_NAME,
+    FONT_SIZE_MONSTER_POWER, FONT_SIZE_MADNESS, FONT_SIZE_HAND_NUMBER,
 )
 
 
@@ -23,420 +50,481 @@ class ImageCompositor:
 
     def __init__(self, base_path: str = "."):
         self.base_path = base_path
-        self._font_cache = {}
-        self._image_cache = {}
+        self._font_cache: dict[int, ImageFont.FreeTypeFont] = {}
+        self._image_cache: dict[str, Image.Image] = {}
 
-    def _asset_path(self, relative_path: str) -> str:
-        return os.path.join(self.base_path, relative_path)
+        # Actual board pixel dimensions (set from board_bg.png)
+        self._bw: int = BOARD_REF_W
+        self._bh: int = BOARD_REF_H
+        self._sx: float = 1.0  # horizontal scale
+        self._sy: float = 1.0  # vertical scale
+        self._detect_board_size()
 
-    def _load_image(self, path: str, size: tuple = None) -> Optional[Image.Image]:
-        cache_key = f"{path}_{size}"
-        if cache_key in self._image_cache:
-            return self._image_cache[cache_key].copy()
+    # ------------------------------------------------------------------
+    # Scaling helpers
+    # ------------------------------------------------------------------
 
-        full_path = self._asset_path(path)
-        if os.path.exists(full_path):
-            img = Image.open(full_path).convert("RGBA")
-            if size:
-                img = img.resize(size, Image.Resampling.LANCZOS)
-            self._image_cache[cache_key] = img
-            return img.copy()
-        return None
-
-    def _create_placeholder(self, width: int, height: int,
-                            color: tuple = (80, 40, 40, 200),
-                            text: str = "",
-                            text_color: tuple = (200, 200, 200)) -> Image.Image:
-        img = Image.new("RGBA", (width, height), color)
-        if text:
-            draw = ImageDraw.Draw(img)
-            font = self._get_font(10)
-            bbox = draw.textbbox((0, 0), text, font=font)
-            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            draw.text(((width - tw) // 2, (height - th) // 2), text,
-                      fill=text_color, font=font)
-        return img
-
-    def _get_font(self, size: int) -> ImageFont.FreeTypeFont:
-        if size in self._font_cache:
-            return self._font_cache[size]
-        font_path = self._asset_path(FONT_PATH)
-        try:
-            font = ImageFont.truetype(font_path, size)
-        except (OSError, IOError):
+    def _detect_board_size(self):
+        full = os.path.join(self.base_path, BOARD_BG_PATH)
+        if os.path.exists(full):
             try:
-                font = ImageFont.truetype(
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size)
-            except (OSError, IOError):
-                font = ImageFont.load_default()
-        self._font_cache[size] = font
-        return font
-
-    def _get_card_back(self, w: int, h: int) -> Image.Image:
-        img = self._load_image(CARD_BACK_PATH, (w, h))
-        return img or self._create_placeholder(w, h, (60, 35, 20, 230), "🂠")
-
-    def _get_card_image(self, card_id: str, w: int, h: int) -> Image.Image:
-        path = CARD_IMAGE_PATH_TEMPLATE.format(card_id=card_id)
-        img = self._load_image(path, (w, h))
-        return img or self._create_placeholder(w, h, (50, 30, 50, 230), card_id[:10])
-
-    def _get_monster_image(self, monster_id: str, w: int, h: int) -> Image.Image:
-        path = MONSTER_IMAGE_PATH_TEMPLATE.format(monster_id=monster_id)
-        img = self._load_image(path, (w, h))
-        return img or self._create_placeholder(w, h, (40, 40, 80, 200), monster_id[:8])
-
-    def _get_symbol(self, path: str, size: int = 22) -> Image.Image:
-        img = self._load_image(path, (size, size))
-        if img is None:
-            color_map = {
-                TAINT_SYMBOL_PATH: (200, 180, 0, 255),
-                ELDER_SYMBOL_PATH: (0, 180, 0, 255),
-                ARCANE_SYMBOL_PATH: (200, 0, 0, 255),
-            }
-            color = color_map.get(path, (180, 180, 180, 255))
-            img = Image.new("RGBA", (size, size), color)
-        return img
-
-    def _load_avatar_bytes(self, avatar_bytes: bytes, size: int = 40) -> Image.Image:
-        if avatar_bytes:
-            try:
-                img = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
-                return img.resize((size, size), Image.Resampling.LANCZOS)
+                with Image.open(full) as im:
+                    self._bw, self._bh = im.size
             except Exception:
                 pass
-        return self._create_placeholder(size, size, (100, 100, 100, 200), "?")
+        self._sx = self._bw / BOARD_REF_W
+        self._sy = self._bh / BOARD_REF_H
 
-    def render_board(self, game_state: GameState,
+    def _p(self, x: int, y: int) -> tuple[int, int]:
+        """Scale a reference point."""
+        return int(x * self._sx), int(y * self._sy)
+
+    def _sz(self, w: int, h: int) -> tuple[int, int]:
+        """Scale a (width, height) pair."""
+        return max(1, int(w * self._sx)), max(1, int(h * self._sy))
+
+    def _box(self, b: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        """Scale an (x, y, w, h) box."""
+        x, y, bw, bh = b
+        return (int(x * self._sx), int(y * self._sy),
+                max(1, int(bw * self._sx)), max(1, int(bh * self._sy)))
+
+    def _fs(self, ref: int) -> int:
+        """Scale a font size."""
+        return max(8, int(ref * (self._sx + self._sy) / 2))
+
+    # ------------------------------------------------------------------
+    # Asset loading
+    # ------------------------------------------------------------------
+
+    def _asset(self, rel: str) -> str:
+        return os.path.join(self.base_path, rel)
+
+    def _load(self, path: str, size: tuple = None) -> Optional[Image.Image]:
+        key = f"{path}_{size}"
+        if key in self._image_cache:
+            return self._image_cache[key].copy()
+        full = self._asset(path)
+        if not os.path.exists(full):
+            return None
+        im = Image.open(full).convert("RGBA")
+        if size:
+            im = im.resize(size, Image.Resampling.LANCZOS)
+        self._image_cache[key] = im
+        return im.copy()
+
+    def _placeholder(self, w: int, h: int,
+                     colour=(60, 35, 20, 200), label="") -> Image.Image:
+        im = Image.new("RGBA", (w, h), colour)
+        if label:
+            d = ImageDraw.Draw(im)
+            f = self._font(max(8, min(14, w // max(len(label), 1))))
+            bb = d.textbbox((0, 0), label, font=f)
+            d.text(((w - bb[2] + bb[0]) // 2, (h - bb[3] + bb[1]) // 2),
+                   label, fill=(200, 200, 200), font=f)
+        return im
+
+    def _font(self, size: int) -> ImageFont.FreeTypeFont:
+        if size in self._font_cache:
+            return self._font_cache[size]
+        fp = self._asset(FONT_PATH)
+        for path in [fp,
+                     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]:
+            try:
+                f = ImageFont.truetype(path, size)
+                self._font_cache[size] = f
+                return f
+            except (OSError, IOError):
+                continue
+        f = ImageFont.load_default()
+        self._font_cache[size] = f
+        return f
+
+    def _card_back(self, w: int, h: int) -> Image.Image:
+        return self._load(CARD_BACK_PATH, (w, h)) or \
+               self._placeholder(w, h, (60, 35, 20, 200))
+
+    def _card_face(self, cid: str, w: int, h: int) -> Image.Image:
+        p = CARD_IMAGE_PATH_TEMPLATE.format(card_id=cid)
+        return self._load(p, (w, h)) or \
+               self._placeholder(w, h, (50, 30, 50, 230), cid[:12])
+
+    def _monster_img(self, mid: str, w: int, h: int) -> Image.Image:
+        p = MONSTER_IMAGE_PATH_TEMPLATE.format(monster_id=mid)
+        return self._load(p, (w, h)) or \
+               self._placeholder(w, h, (40, 40, 80, 200), mid[:8])
+
+    def _avatar(self, raw: bytes, w: int, h: int) -> Image.Image:
+        if raw:
+            try:
+                im = Image.open(io.BytesIO(raw)).convert("RGBA")
+                return im.resize((w, h), Image.Resampling.LANCZOS)
+            except Exception:
+                pass
+        return self._placeholder(w, h, (80, 80, 80, 180), "?")
+
+    # ------------------------------------------------------------------
+    # Drawing helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _centre_text(draw: ImageDraw.Draw, text: str,
+                     box: tuple, font, fill):
+        """Draw *text* centred within (x, y, w, h)."""
+        bx, by, bw, bh = box
+        bb = draw.textbbox((0, 0), text, font=font)
+        tw, th = bb[2] - bb[0], bb[3] - bb[1]
+        draw.text((bx + (bw - tw) // 2, by + (bh - th) // 2),
+                  text, fill=fill, font=font)
+
+    @staticmethod
+    def _shadow_text(draw: ImageDraw.Draw, pos: tuple, text: str,
+                     font, fill, shadow=(0, 0, 0)):
+        x, y = pos
+        draw.text((x + 1, y + 1), text, fill=shadow, font=font)
+        draw.text((x, y), text, fill=fill, font=font)
+
+    @staticmethod
+    def _life_col(life: int, mx: int = 40):
+        if life <= mx * 0.3:
+            return (255, 50, 50)
+        if life <= mx * 0.6:
+            return (255, 180, 0)
+        return (0, 220, 0)
+
+    @staticmethod
+    def _san_col(san: int):
+        if san <= 0:
+            return (255, 50, 50)
+        if san <= 10:
+            return (255, 180, 0)
+        return (100, 200, 255)
+
+    # ------------------------------------------------------------------
+    # Board render
+    # ------------------------------------------------------------------
+
+    def render_board(self, gs: GameState, *,
                      resolving_card_id: str = None,
                      resolving_player_is_bottom: bool = True,
                      book_open: bool = False,
                      p1_avatar_bytes: bytes = None,
                      p2_avatar_bytes: bytes = None) -> bytes:
-        """Render the full game board."""
 
-        # Load background
-        board = self._load_image(BOARD_BG_PATH, (BOARD_WIDTH, BOARD_HEIGHT))
+        board = self._load(BOARD_BG_PATH)
         if board is None:
-            board = Image.new("RGBA", (BOARD_WIDTH, BOARD_HEIGHT), (60, 30, 20, 255))
+            board = Image.new("RGBA", (self._bw, self._bh), (40, 30, 25, 255))
+        if board.size != (self._bw, self._bh):
+            board = board.resize((self._bw, self._bh), Image.Resampling.LANCZOS)
 
         draw = ImageDraw.Draw(board)
 
-        p1 = game_state.player1  # Bottom (initiator)
-        p2 = game_state.player2  # Top (challenger/bot)
+        p1 = gs.player1   # bottom / main
+        p2 = gs.player2   # top / challenger / bot
 
-        # ============================================================
-        # TOP PLAYER (p2) — upper portion of board
-        # ============================================================
+        vf = self._font(self._fs(FONT_SIZE_STAT_VALUE))
+        rf = self._font(self._fs(FONT_SIZE_RANK))
+        nf = self._font(self._fs(FONT_SIZE_NAME))
+        mf = self._font(self._fs(FONT_SIZE_MADNESS))
+        pf = self._font(self._fs(FONT_SIZE_MONSTER_POWER))
 
-        # -- Face-down hand cards --
-        top_card_w, top_card_h = 68, 90
-        top_card_spacing = 10
-        top_hand_x, top_hand_y = 148, 12
-        for i in range(len(p2.hand)):
-            card = self._get_card_back(top_card_w, top_card_h)
-            cx = top_hand_x + i * (top_card_w + top_card_spacing)
-            board.paste(card, (cx, top_hand_y), card)
+        # ====== TOP PLAYER (p2) ======
 
-        # -- Life and Sanity (top right) --
-        label_font = self._get_font(22)
-        value_font = self._get_font(26)
+        # Card backs in top slots
+        for i in range(min(len(p2.hand), len(TOP_CARD_SLOTS))):
+            bx, by, bw, bh = self._box(TOP_CARD_SLOTS[i])
+            cb = self._card_back(bw, bh)
+            board.paste(cb, (bx, by), cb)
 
-        draw.text((640, 8), "Life", fill=(200, 180, 130), font=label_font)
-        life_color = (0, 220, 0) if p2.life > 15 else (255, 50, 50)
-        draw.text((648, 34), str(p2.life), fill=life_color, font=value_font)
+        # Life number
+        self._centre_text(draw, str(p2.life),
+                          self._box(TOP_LIFE_BOX), vf,
+                          self._life_col(p2.life, p2.max_life))
 
-        draw.text((740, 8), "Sanity", fill=(200, 180, 130), font=label_font)
-        san_color = (100, 200, 255) if p2.sanity > 0 else (255, 50, 50)
-        draw.text((755, 34), str(p2.sanity), fill=san_color, font=value_font)
+        # Sanity number
+        self._centre_text(draw, str(p2.sanity),
+                          self._box(TOP_SANITY_BOX), vf,
+                          self._san_col(p2.sanity))
 
-        # -- Avatar (top right, next to sanity) --
-        avatar_img = self._load_avatar_bytes(p2_avatar_bytes, 40)
-        board.paste(avatar_img, (810, 30), avatar_img)
-        name_font = self._get_font(11)
-        # Truncate name to fit
-        name = p2.display_name[:12]
-        draw.text((810, 72), name, fill=(200, 200, 200), font=name_font)
+        # Avatar
+        ab = self._box(TOP_AVATAR_BOX)
+        av = self._avatar(p2_avatar_bytes, ab[2], ab[3])
+        board.paste(av, (ab[0], ab[1]), av)
 
-        # -- Rank (right side, below cards) --
-        rank_font = self._get_font(18)
-        rank_text = f"{p2.rank}- {p2.rank_title}"
-        draw.text((660, 140), rank_text, fill=(200, 180, 130), font=rank_font)
+        # Name
+        self._shadow_text(draw, self._p(*TOP_NAME_POS),
+                          p2.display_name[:14], nf, (200, 200, 200))
 
-        # -- Stats row (taint, elder, arcane) centered-ish --
-        stat_font = self._get_font(20)
-        stat_sym_size = 22
-        stat_y = 140
-        stat_base_x = 370
-        stat_gap = 70
+        # Rank (right side of upper bar)
+        self._shadow_text(draw, self._p(*TOP_RANK_POS),
+                          f"{p2.rank}. {p2.rank_title}", rf,
+                          (200, 180, 130))
 
-        stats = [
-            (TAINT_SYMBOL_PATH, p2.taint, (200, 180, 0)),
-            (ELDER_SYMBOL_PATH, p2.elder_defense, (0, 200, 0)),
-            (ARCANE_SYMBOL_PATH, p2.arcane, (220, 50, 50)),
-        ]
-        for i, (sym_path, val, color) in enumerate(stats):
-            sx = stat_base_x + i * stat_gap
-            sym = self._get_symbol(sym_path, stat_sym_size)
-            board.paste(sym, (sx, stat_y), sym)
-            draw.text((sx + stat_sym_size + 4, stat_y - 1), str(val),
-                      fill=color, font=stat_font)
+        # Stat numbers (no symbols — baked in)
+        self._shadow_text(draw, self._p(*TOP_TAINT_NUM_POS),
+                          str(p2.taint), vf, (200, 180, 0))
+        self._shadow_text(draw, self._p(*TOP_ARCANE_NUM_POS),
+                          str(p2.arcane), vf, (100, 200, 100))
+        self._shadow_text(draw, self._p(*TOP_ELDER_NUM_POS),
+                          str(p2.elder_defense), vf, (220, 50, 50))
 
-        # -- Invulnerability indicator --
         if p2.invulnerable:
-            draw.text((stat_base_x + 3 * stat_gap, stat_y), "🛡️",
-                      fill=(0, 200, 255), font=self._get_font(18))
-
-        # -- Madness indicator --
+            self._shadow_text(draw, self._p(*TOP_INVULN_POS),
+                              "INV", mf, (0, 200, 255))
         if p2.madness:
-            madness_font = self._get_font(13)
-            draw.text((148, top_hand_y + top_card_h + 4),
-                      f"🤯 {p2.madness}", fill=(255, 100, 100), font=madness_font)
+            self._shadow_text(draw, self._p(*TOP_MADNESS_POS),
+                              f"* {p2.madness}", mf, (255, 100, 100))
 
-        # ============================================================
-        # CENTER — Book, play areas, monsters
-        # ============================================================
+        # ====== CENTRE ======
 
-        # -- Book --
+        # Book
         if book_open:
-            book_img = self._load_image(BOOK_OPEN_PATH, (160, 100))
-            if book_img is None:
-                book_img = self._create_placeholder(160, 100, (120, 100, 50, 220), "📖")
-            board.paste(book_img, (350, 215), book_img)
+            bsz = self._sz(*BOOK_OPEN_SIZE)
+            bk = self._load(BOOK_OPEN_PATH, bsz)
+            if bk is None:
+                bk = self._placeholder(*bsz, (120, 100, 50, 220), "OPEN")
+            board.paste(bk, self._p(*BOOK_OPEN_POS), bk)
         else:
-            book_img = self._load_image(BOOK_CLOSED_PATH, (80, 100))
-            if book_img is None:
-                book_img = self._create_placeholder(80, 100, (100, 80, 40, 220), "📕")
-            board.paste(book_img, (390, 215), book_img)
+            bsz = self._sz(*BOOK_CLOSED_SIZE)
+            bk = self._load(BOOK_CLOSED_PATH, bsz)
+            if bk is None:
+                bk = self._placeholder(*bsz, (100, 80, 40, 220))
+            board.paste(bk, self._p(*BOOK_CLOSED_POS), bk)
 
-        # -- Resolving card display --
-        play_card_w, play_card_h = 90, 120
+        # Resolving card (enlarged)
         if resolving_card_id:
-            card_img = self._get_card_image(resolving_card_id, play_card_w, play_card_h)
             if resolving_player_is_bottom:
-                # Bottom player's card: show in lower-center area
-                board.paste(card_img, (270, 300), card_img)
+                csz = self._sz(*CARD_DISPLAY_RIGHT_SIZE)
+                cpos = self._p(*CARD_DISPLAY_RIGHT_POS)
             else:
-                # Top player's card: show in upper-center area
-                board.paste(card_img, (270, 145), card_img)
+                csz = self._sz(*CARD_DISPLAY_LEFT_SIZE)
+                cpos = self._p(*CARD_DISPLAY_LEFT_POS)
+            ci = self._card_face(resolving_card_id, *csz)
+            board.paste(ci, cpos, ci)
 
-        # -- Monsters --
-        monster_w, monster_h = 80, 100
-
-        # Bottom player's monster: RIGHT side of center
+        # Monsters
         if p1.monster:
-            m_img = self._get_monster_image(p1.monster.monster_id, monster_w, monster_h)
-            mx, my = 540, 265
-            board.paste(m_img, (mx, my), m_img)
-            power_font = self._get_font(18)
-            draw.text((mx + 4, my + monster_h - 24),
-                      str(p1.monster.power), fill=(255, 50, 50), font=power_font)
+            msz = self._sz(*BOTTOM_MONSTER_SIZE)
+            mi = self._monster_img(p1.monster.monster_id, *msz)
+            mp = self._p(*BOTTOM_MONSTER_POS)
+            board.paste(mi, mp, mi)
+            px = mp[0] + msz[0] // 2 - 8
+            py = mp[1] + msz[1] - self._fs(FONT_SIZE_MONSTER_POWER) - 4
+            self._shadow_text(draw, (px, py), str(p1.monster.power),
+                              pf, (255, 80, 80))
 
-        # Top player's monster: LEFT side of center (mirrored)
         if p2.monster:
-            m_img = self._get_monster_image(p2.monster.monster_id, monster_w, monster_h)
-            mx, my = 200, 175
-            board.paste(m_img, (mx, my), m_img)
-            power_font = self._get_font(18)
-            draw.text((mx + 4, my + monster_h - 24),
-                      str(p2.monster.power), fill=(255, 50, 50), font=power_font)
+            msz = self._sz(*TOP_MONSTER_SIZE)
+            mi = self._monster_img(p2.monster.monster_id, *msz)
+            mp = self._p(*TOP_MONSTER_POS)
+            board.paste(mi, mp, mi)
+            px = mp[0] + msz[0] // 2 - 8
+            py = mp[1] + msz[1] - self._fs(FONT_SIZE_MONSTER_POWER) - 4
+            self._shadow_text(draw, (px, py), str(p2.monster.power),
+                              pf, (255, 80, 80))
 
-        # ============================================================
-        # BOTTOM PLAYER (p1) — lower portion of board
-        # ============================================================
+        # ====== BOTTOM PLAYER (p1) ======
 
-        # -- Stats row (taint, elder, arcane) --
-        bot_stat_y = 365
-        for i, (sym_path, val, color) in enumerate([
-            (TAINT_SYMBOL_PATH, p1.taint, (200, 180, 0)),
-            (ELDER_SYMBOL_PATH, p1.elder_defense, (0, 200, 0)),
-            (ARCANE_SYMBOL_PATH, p1.arcane, (220, 50, 50)),
-        ]):
-            sx = stat_base_x + i * stat_gap
-            sym = self._get_symbol(sym_path, stat_sym_size)
-            board.paste(sym, (sx, bot_stat_y), sym)
-            draw.text((sx + stat_sym_size + 4, bot_stat_y - 1), str(val),
-                      fill=color, font=stat_font)
+        # Avatar
+        ab = self._box(BOTTOM_AVATAR_BOX)
+        av = self._avatar(p1_avatar_bytes, ab[2], ab[3])
+        board.paste(av, (ab[0], ab[1]), av)
 
-        # -- Invulnerability --
+        # Name
+        self._shadow_text(draw, self._p(*BOTTOM_NAME_POS),
+                          p1.display_name[:14], nf, (200, 200, 200))
+
+        # Life / Sanity
+        self._centre_text(draw, str(p1.life),
+                          self._box(BOTTOM_LIFE_BOX), vf,
+                          self._life_col(p1.life, p1.max_life))
+        self._centre_text(draw, str(p1.sanity),
+                          self._box(BOTTOM_SANITY_BOX), vf,
+                          self._san_col(p1.sanity))
+
+        # Rank (left side of lower bar)
+        self._shadow_text(draw, self._p(*BOTTOM_RANK_POS),
+                          f"{p1.rank}. {p1.rank_title}", rf,
+                          (200, 180, 130))
+
+        # Stats
+        self._shadow_text(draw, self._p(*BOTTOM_TAINT_NUM_POS),
+                          str(p1.taint), vf, (200, 180, 0))
+        self._shadow_text(draw, self._p(*BOTTOM_ARCANE_NUM_POS),
+                          str(p1.arcane), vf, (100, 200, 100))
+        self._shadow_text(draw, self._p(*BOTTOM_ELDER_NUM_POS),
+                          str(p1.elder_defense), vf, (220, 50, 50))
+
         if p1.invulnerable:
-            draw.text((stat_base_x + 3 * stat_gap, bot_stat_y), "🛡️",
-                      fill=(0, 200, 255), font=self._get_font(18))
-
-        # -- Rank --
-        draw.text((250, bot_stat_y), f"{p1.rank}- {p1.rank_title}",
-                  fill=(200, 180, 130), font=rank_font)
-
-        # -- Madness indicator --
+            self._shadow_text(draw, self._p(*BOTTOM_INVULN_POS),
+                              "INV", mf, (0, 200, 255))
         if p1.madness:
-            madness_font = self._get_font(13)
-            draw.text((148, 415),
-                      f"🤯 {p1.madness}", fill=(255, 100, 100), font=madness_font)
+            self._shadow_text(draw, self._p(*BOTTOM_MADNESS_POS),
+                              f"* {p1.madness}", mf, (255, 100, 100))
 
-        # -- Face-down hand cards --
-        bot_card_w, bot_card_h = 95, 83
-        bot_card_spacing = 10
-        bot_hand_x, bot_hand_y = 165, 432
-        for i in range(len(p1.hand)):
-            card = self._get_card_back(bot_card_w, bot_card_h)
-            cx = bot_hand_x + i * (bot_card_w + bot_card_spacing)
-            board.paste(card, (cx, bot_hand_y), card)
+        # Card backs in bottom slots
+        for i in range(min(len(p1.hand), len(BOTTOM_CARD_SLOTS))):
+            bx, by, bw, bh = self._box(BOTTOM_CARD_SLOTS[i])
+            cb = self._card_back(bw, bh)
+            board.paste(cb, (bx, by), cb)
 
-        # -- Sanity (bottom left) --
-        draw.text((25, 470), str(p1.sanity), fill=san_color, font=value_font)
-        draw.text((18, 500), "Sanity", fill=(200, 180, 130), font=self._get_font(16))
+        # --- serialise ---
+        buf = io.BytesIO()
+        board.save(buf, format="PNG")
+        buf.seek(0)
+        return buf.getvalue()
 
-        # Recalculate sanity color for p1
-        p1_san_color = (100, 200, 255) if p1.sanity > 0 else (255, 50, 50)
-        p1_life_color = (0, 220, 0) if p1.life > 15 else (255, 50, 50)
-
-        draw.text((25, 470), str(p1.sanity), fill=p1_san_color, font=value_font)
-        draw.text((100, 470), str(p1.life), fill=p1_life_color, font=value_font)
-        draw.text((18, 500), "Sanity", fill=(200, 180, 130), font=self._get_font(16))
-        draw.text((95, 500), "Life", fill=(200, 180, 130), font=self._get_font(16))
-
-        # -- Avatar (bottom left corner) --
-        avatar_img = self._load_avatar_bytes(p1_avatar_bytes, 40)
-        board.paste(avatar_img, (8, 432), avatar_img)
-        draw.text((8, 520), p1.display_name[:12],
-                  fill=(200, 200, 200), font=name_font)
-
-        # Convert to bytes
-        buffer = io.BytesIO()
-        board.save(buffer, format="PNG")
-        buffer.seek(0)
-        return buffer.getvalue()
+    # ------------------------------------------------------------------
+    # Hand view (ephemeral, face-up)
+    # ------------------------------------------------------------------
 
     def render_hand(self, player: Player) -> bytes:
-        """Render a player's hand as a face-up image (for ephemeral display)."""
         if not player.hand:
-            img = Image.new("RGBA", (400, 140), (30, 20, 15, 255))
-            draw = ImageDraw.Draw(img)
-            font = self._get_font(16)
-            draw.text((100, 55), "No cards in hand",
-                      fill=(200, 200, 200), font=font)
+            im = Image.new("RGBA", (600, 200), (30, 20, 15, 255))
+            d = ImageDraw.Draw(im)
+            d.text((180, 80), "No cards in hand",
+                   fill=(200, 200, 200), font=self._font(20))
         else:
-            card_w, card_h = 120, 170
-            spacing = 8
-            total_w = len(player.hand) * (card_w + spacing) - spacing + 20
-            img = Image.new("RGBA", (total_w, card_h + 40), (30, 20, 15, 240))
+            cw, ch = 150, 210
+            sp = 12
+            pad = 20
+            tw = len(player.hand) * (cw + sp) - sp + pad * 2
+            th = ch + 50 + pad * 2
+
+            bg = self._load(HAND_BG_PATH, (tw, th))
+            im = bg if bg else Image.new("RGBA", (tw, th), (30, 20, 15, 240))
+            d = ImageDraw.Draw(im)
+            nf = self._font(self._fs(FONT_SIZE_HAND_NUMBER))
 
             for i, card in enumerate(player.hand):
-                card_img = self._get_card_image(card.card_id, card_w, card_h)
-                x = 10 + i * (card_w + spacing)
-                img.paste(card_img, (x, 5), card_img)
+                ci = self._card_face(card.card_id, cw, ch)
+                x = pad + i * (cw + sp)
+                im.paste(ci, (x, pad), ci)
+                lbl = f"[{i + 1}]"
+                bb = d.textbbox((0, 0), lbl, font=nf)
+                lx = x + (cw - bb[2] + bb[0]) // 2
+                self._shadow_text(d, (lx, pad + ch + 8), lbl, nf,
+                                  (200, 200, 100))
 
-                draw = ImageDraw.Draw(img)
-                num_font = self._get_font(14)
-                draw.text((x + card_w // 2 - 5, card_h + 10),
-                          f"[{i + 1}]", fill=(200, 200, 100), font=num_font)
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        buf.seek(0)
+        return buf.getvalue()
 
-        buffer = io.BytesIO()
-        img.save(buffer, format="PNG")
-        buffer.seek(0)
-        return buffer.getvalue()
+    # ------------------------------------------------------------------
+    # Menu
+    # ------------------------------------------------------------------
 
     def render_menu(self) -> bytes:
-        """Render the main menu image."""
-        menu = self._load_image(MENU_BG_PATH, (BOARD_WIDTH, BOARD_HEIGHT))
-        if menu is None:
-            menu = Image.new("RGBA", (BOARD_WIDTH, BOARD_HEIGHT), (40, 20, 15, 255))
-            draw = ImageDraw.Draw(menu)
-            title_font = self._get_font(32)
-            draw.text((200, 30), "NECRONOMICON",
-                      fill=(180, 150, 100), font=title_font)
-            option_font = self._get_font(24)
-            options = ["Campaign", "Challenge Mode", "Multiplayer", "How to Play"]
-            for i, opt in enumerate(options):
-                draw.text((350, 130 + i * 80), opt,
-                          fill=(200, 180, 130), font=option_font)
+        im = self._load(MENU_BG_PATH)
+        if im is None:
+            im = Image.new("RGBA", (self._bw, self._bh), (40, 20, 15, 255))
+            d = ImageDraw.Draw(im)
+            d.text(self._p(200, 30), "NECRONOMICON",
+                   fill=(180, 150, 100), font=self._font(self._fs(32)))
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        buf.seek(0)
+        return buf.getvalue()
 
-        buffer = io.BytesIO()
-        menu.save(buffer, format="PNG")
-        buffer.seek(0)
-        return buffer.getvalue()
+    # ------------------------------------------------------------------
+    # End screen  (supports win, loss, and draw)
+    # ------------------------------------------------------------------
 
-    def render_end_screen(self, winner: Player, xp_data: dict,
-                          rank_data: dict, is_draw: bool = False) -> bytes:
-        """Render the end-of-game score screen."""
-        bg = self._load_image(END_SCREEN_BG_PATH, (BOARD_WIDTH, BOARD_HEIGHT))
+    def render_end_screen(self, player: Player, xp_data: dict,
+                          rank_data: dict, *,
+                          is_draw: bool = False,
+                          is_loss: bool = False) -> bytes:
+        """Render end-of-game results.
+
+        *player*   — the human whose perspective we are showing.
+        *is_loss*  — True when the human lost (e.g. forfeit); no XP gained.
+        """
+        bg = self._load(END_SCREEN_BG_PATH)
         if bg is None:
-            bg = Image.new("RGBA", (BOARD_WIDTH, BOARD_HEIGHT), (40, 25, 15, 255))
+            bg = Image.new("RGBA", (self._bw, self._bh), (40, 25, 15, 255))
+        if bg.size != (self._bw, self._bh):
+            bg = bg.resize((self._bw, self._bh), Image.Resampling.LANCZOS)
 
-        draw = ImageDraw.Draw(bg)
-        title_font = self._get_font(32)
-        large_font = self._get_font(24)
-        stat_font = self._get_font(18)
+        d = ImageDraw.Draw(bg)
+        tf = self._font(self._fs(32))
+        lf = self._font(self._fs(24))
+        sf = self._font(self._fs(18))
+        smf = self._font(self._fs(14))
 
         if is_draw:
-            draw.text((340, 20), "DRAW", fill=(200, 200, 100), font=title_font)
+            d.text(self._p(340, 20), "DRAW", fill=(200, 200, 100), font=tf)
+        elif is_loss:
+            d.text(self._p(300, 20), "DEFEAT", fill=(200, 50, 50), font=tf)
         else:
-            draw.text((180, 20), "ROUND SCORES and RANK",
-                      fill=(0, 200, 100), font=title_font)
+            d.text(self._p(180, 20), "ROUND SCORES and RANK",
+                   fill=(0, 200, 100), font=tf)
 
-        y = 80
-        lh = 32
+        y = 80;  lh = 32
 
-        draw.text((60, y), "Previous Rank", fill=(200, 200, 200), font=stat_font)
-        draw.text((550, y),
-                  f"{rank_data['old_rank']}- {rank_data['old_rank_name']}",
-                  fill=(200, 200, 200), font=stat_font)
+        d.text(self._p(60, y), "Previous Rank", fill=(200, 200, 200), font=sf)
+        d.text(self._p(550, y),
+               f"{rank_data['old_rank']}. {rank_data['old_rank_name']}",
+               fill=(200, 200, 200), font=sf)
         y += lh
 
-        life_c = (0, 200, 0) if xp_data.get("remaining_life", 0) > 0 else (200, 0, 0)
-        draw.text((60, y), "Remaining Life", fill=(200, 200, 200), font=stat_font)
-        draw.text((600, y), str(xp_data.get("remaining_life", 0)),
-                  fill=life_c, font=stat_font)
+        lv = xp_data.get("remaining_life", 0)
+        d.text(self._p(60, y), "Remaining Life", fill=(200, 200, 200), font=sf)
+        d.text(self._p(600, y), str(lv),
+               fill=(0, 200, 0) if lv > 0 else (200, 0, 0), font=sf)
         y += lh
 
-        san = xp_data.get("remaining_sanity", 0)
-        san_c = (0, 150, 255) if san > 0 else (200, 0, 0)
-        draw.text((60, y), "Remaining Sanity", fill=(200, 200, 200), font=stat_font)
-        draw.text((600, y), str(san), fill=san_c, font=stat_font)
+        sv = xp_data.get("remaining_sanity", 0)
+        d.text(self._p(60, y), "Remaining Sanity", fill=(200, 200, 200), font=sf)
+        d.text(self._p(600, y), str(sv),
+               fill=(0, 150, 255) if sv > 0 else (200, 0, 0), font=sf)
         y += lh
 
-        draw.text((60, y), "Damage Inflicted", fill=(200, 200, 200), font=stat_font)
-        draw.text((600, y), str(xp_data.get("damage_dealt", 0)),
-                  fill=(200, 200, 200), font=stat_font)
-        label_font = self._get_font(14)
-        draw.text((660, y + 2),
-                  f"+ {xp_data.get('best_attack', 0)}",
-                  fill=(200, 200, 200), font=label_font)
+        d.text(self._p(60, y), "Damage Inflicted", fill=(200, 200, 200), font=sf)
+        d.text(self._p(600, y), str(xp_data.get("damage_dealt", 0)),
+               fill=(200, 200, 200), font=sf)
+        d.text(self._p(660, y + 2),
+               f"+ {xp_data.get('best_attack', 0)} best",
+               fill=(180, 180, 180), font=smf)
         y += lh
 
-        draw.text((60, y), "−  Damage Received", fill=(200, 200, 200), font=stat_font)
-        draw.text((600, y), str(xp_data.get("damage_received", 0)),
-                  fill=(200, 50, 50), font=stat_font)
+        d.text(self._p(60, y), "-  Damage Received", fill=(200, 200, 200), font=sf)
+        d.text(self._p(600, y), str(xp_data.get("damage_received", 0)),
+               fill=(200, 50, 50), font=sf)
         y += lh + 10
 
-        draw.line([(60, y), (700, y)], fill=(150, 130, 100), width=2)
+        lx1, ly = self._p(60, y);  lx2, _ = self._p(700, y)
+        d.line([(lx1, ly), (lx2, ly)], fill=(150, 130, 100), width=2)
         y += 15
 
-        draw.text((60, y), "Total for this Round", fill=(200, 200, 200), font=stat_font)
-        draw.text((600, y), str(xp_data.get("total", 0)),
-                  fill=(200, 200, 200), font=stat_font)
+        total = xp_data.get("total", 0) if not is_loss else 0
+        d.text(self._p(60, y), "XP for this Round", fill=(200, 200, 200), font=sf)
+        d.text(self._p(600, y), str(total),
+               fill=(200, 200, 200) if not is_loss else (150, 150, 150),
+               font=sf)
         y += lh
 
-        prev_xp = rank_data.get("total_xp", 0) - xp_data.get("total", 0)
-        draw.text((60, y), "Previous Total", fill=(200, 200, 200), font=stat_font)
-        draw.text((600, y), str(max(0, prev_xp)),
-                  fill=(200, 200, 200), font=stat_font)
+        prev = rank_data.get("total_xp", 0) - (total if not is_loss else 0)
+        d.text(self._p(60, y), "Previous Total", fill=(200, 200, 200), font=sf)
+        d.text(self._p(600, y), str(max(0, prev)), fill=(200, 200, 200), font=sf)
         y += lh
 
-        draw.text((60, y), "Current Total", fill=(0, 200, 100), font=large_font)
-        draw.text((580, y), str(rank_data.get("total_xp", 0)),
-                  fill=(0, 200, 100), font=large_font)
+        d.text(self._p(60, y), "Current Total", fill=(0, 200, 100), font=lf)
+        d.text(self._p(580, y), str(rank_data.get("total_xp", 0)),
+               fill=(0, 200, 100), font=lf)
         y += lh + 20
 
-        draw.text((60, y), "Current Rank", fill=(0, 200, 100), font=large_font)
-        r_text = f"{rank_data['new_rank']}- {rank_data['new_rank_name']}"
-        draw.text((450, y), r_text, fill=(0, 200, 100), font=large_font)
+        d.text(self._p(60, y), "Current Rank", fill=(0, 200, 100), font=lf)
+        d.text(self._p(450, y),
+               f"{rank_data['new_rank']}. {rank_data['new_rank_name']}",
+               fill=(0, 200, 100), font=lf)
 
-        if rank_data.get("ranked_up"):
-            draw.text((300, y + 40), "⬆ RANK UP! ⬆",
-                      fill=(255, 215, 0), font=title_font)
+        if rank_data.get("ranked_up") and not is_loss:
+            d.text(self._p(300, y + 40), "RANK UP!",
+                   fill=(255, 215, 0), font=tf)
 
-        buffer = io.BytesIO()
-        bg.save(buffer, format="PNG")
-        buffer.seek(0)
-        return buffer.getvalue()
+        buf = io.BytesIO()
+        bg.save(buf, format="PNG")
+        buf.seek(0)
+        return buf.getvalue()
