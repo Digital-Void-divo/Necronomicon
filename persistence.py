@@ -117,3 +117,23 @@ def get_all_player_data() -> list[dict]:
         data["user_id"] = user_id
         results.append(data)
     return results
+
+
+def get_completed_challenges(user_id: str) -> list:
+    """Return list of completed challenge IDs for a player."""
+    data = load_player_data(user_id)
+    return data.get("challenges_completed", [])
+
+
+def is_challenge_completed(user_id: str, challenge_id: str) -> bool:
+    """Return True if the player has completed the given challenge."""
+    return challenge_id in get_completed_challenges(user_id)
+
+
+def mark_challenge_completed(user_id: str, challenge_id: str):
+    """Mark a challenge as completed for a player (idempotent)."""
+    data = load_player_data(user_id)
+    completed = data.setdefault("challenges_completed", [])
+    if challenge_id not in completed:
+        completed.append(challenge_id)
+        save_player_data(user_id, data)
