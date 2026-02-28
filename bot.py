@@ -32,6 +32,7 @@ from persistence import (
 from config import CARD_DISPLAY_TIME, RANK_NAMES
 from audio import audio_manager
 from role_manager import assign_rank_role, setup_rank_roles, delete_rank_roles, sync_all_members
+from guide import send_guide
 
 
 # === Bot Setup ===
@@ -208,8 +209,6 @@ async def try_play_audio(session: GameSession, coro):
 
 # === Discord UI Views ===
 
-GUIDE_TEXT = "**How to Play** instructions will be defined later."
-
 
 class MainMenuView(discord.ui.View):
     def __init__(self):
@@ -229,7 +228,7 @@ class MainMenuView(discord.ui.View):
 
     @discord.ui.button(label="Guide", style=discord.ButtonStyle.secondary, emoji="❓", row=0)
     async def guide_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(GUIDE_TEXT, ephemeral=True)
+        await send_guide(interaction)
 
     @discord.ui.button(label="Exit", style=discord.ButtonStyle.secondary, emoji="✖️", row=0)
     async def exit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -327,7 +326,7 @@ class InGameGuideButton(discord.ui.Button):
         super().__init__(label="Guide", style=discord.ButtonStyle.secondary, emoji="❓", row=1)
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_message(GUIDE_TEXT, ephemeral=True)
+        await send_guide(interaction)
 
 
 class DiscardChoiceView(discord.ui.View):
@@ -1040,6 +1039,13 @@ async def campaign_command(interaction: discord.Interaction):
 @bot.tree.command(name="challenges", description="Browse and start challenge mode scenarios")
 async def challenges_command(interaction: discord.Interaction):
     await show_challenge_select(interaction)
+
+
+@bot.tree.command(name="guide", description="Open the Necronomicon guide")
+@app_commands.describe(page="Page to open (1–13, default 1)")
+async def guide_command(interaction: discord.Interaction, page: int = 1):
+    page_index = max(0, min(page - 1, 12))  # clamp to valid range
+    await send_guide(interaction, page=page_index)
 
 
 @bot.tree.command(name="challenge", description="Challenge another player")
