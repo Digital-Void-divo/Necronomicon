@@ -353,19 +353,27 @@ class MainMenuView(discord.ui.View):
     async def campaign_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._owner_check(interaction):
             return
-        await start_campaign(interaction)
+        # FIX: pass the menu message so the game board replaces it in-place
+        await start_campaign(interaction, replace_message=interaction.message)
 
     @discord.ui.button(label="Challenges", style=discord.ButtonStyle.secondary, emoji="⚔️", row=0)
     async def challenge_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._owner_check(interaction):
             return
+        # Challenge uses an ephemeral dropdown — delete the menu, then show selector
+        menu_msg = interaction.message
         await show_challenge_select(interaction)
+        try:
+            await menu_msg.delete()
+        except Exception:
+            pass
 
     @discord.ui.button(label="Multiplayer", style=discord.ButtonStyle.primary, emoji="👥", row=0)
     async def multiplayer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._owner_check(interaction):
             return
-        await create_multiplayer_lobby(interaction)
+        # FIX: replace the menu message with the lobby message
+        await create_multiplayer_lobby(interaction, replace_message=interaction.message)
 
     @discord.ui.button(label="Guide", style=discord.ButtonStyle.secondary, emoji="❓", row=0)
     async def guide_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -382,8 +390,8 @@ class MainMenuView(discord.ui.View):
 class GameView(discord.ui.View):
     """Main in-game button layout.
 
-    Row 0: Play card buttons (up to 4) + View Hand
-    Row 1: [Play 5 overflow if needed] + Discard + Timer + Guide + Forfeit
+    Row 0: Play card buttons (up to 5)
+    Row 1: View Hand + Discard + Timer + Guide + Forfeit
     Row 2: Taunt buttons
     """
 
@@ -398,23 +406,19 @@ class GameView(discord.ui.View):
 
         hand_size = len(current.hand)
 
-        # Row 0: Play card buttons (up to 4) + View Hand on the right
-        row0_count = min(hand_size, 4)
-        for i in range(row0_count):
+        # FIX: Row 0 — ALL Play card buttons together (up to 5)
+        for i in range(hand_size):
             can_play, _ = current.can_play_card(i)
             self.add_item(PlayCardButton(session, i, can_play, row=0))
-        self.add_item(ViewHandButton(session, row=0))
 
-        # Row 1: Overflow Play 5 (if hand > 4) + Discard + Timer + Guide + Forfeit
-        if hand_size > 4:
-            can_play, _ = current.can_play_card(4)
-            self.add_item(PlayCardButton(session, 4, can_play, row=1))
+        # Row 1: View Hand + Discard + Timer + Guide + Forfeit
+        self.add_item(ViewHandButton(session, row=1))
         self.add_item(DiscardSelectButton(session))
         self.add_item(CheckTimerButton(session))
         self.add_item(InGameGuideButton())
         self.add_item(ForfeitButton(session))
 
-        # Row 2: Taunt buttons (available to all players in this game, not turn-locked)
+        # Row 2: Taunt buttons
         self.add_item(TauntButton(session, "taunt"))
         self.add_item(TauntButton(session, "congratulate"))
         self.add_item(TauntButton(session, "beg"))
@@ -422,7 +426,7 @@ class GameView(discord.ui.View):
 
 
 class ViewHandButton(discord.ui.Button):
-    def __init__(self, session: GameSession, row: int = 0):
+    def __init__(self, session: GameSession, row: int = 1):
         super().__init__(label="View Hand", style=discord.ButtonStyle.secondary, emoji="👁️", row=row)
         self.session = session
 
@@ -575,12 +579,24 @@ class ForfeitConfirmView(discord.ui.View):
             f"🏆 **{gs.winner.display_name}** wins by forfeit!")
         forfeit_result.messages.extend(forfeit_result.game_over_messages)
 
-        # Disable the confirmation buttons
+        # FIX: Acknowledge the interaction safely, then process game over
         self.disable_all_items()
-        await interaction.response.edit_message(content="🏳️ Forfeiting...", view=self)
+        try:
+            await interaction.response.edit_message(content="🏳️ Forfeiting...", view=self)
+        except Exception:
+            # If the ephemeral timed out, try sending a new ephemeral
+            try:
+                await interaction.response.send_message("🏳️ Forfeiting...", ephemeral=True)
+            except Exception:
+                pass  # Interaction is dead — proceed with cleanup anyway
         self.stop()
 
-        await handle_game_over(session, forfeit_result)
+        # FIX: Always attempt game-over processing; handle_game_over has its
+        # own try/finally that guarantees cleanup even on error.
+        try:
+            await handle_game_over(session, forfeit_result)
+        except Exception as e:
+            print(f"[Forfeit] Error in handle_game_over: {e}")
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -691,7 +707,9 @@ class MultiplayerLobbyView(discord.ui.View):
             await interaction.response.send_message(
                 "You already have an active game! Finish or `/forfeit` it first.", ephemeral=True)
             return
-        await start_multiplayer_game(interaction, self.host_id)
+        # FIX: pass lobby message so the game board replaces it
+        await start_multiplayer_game(interaction, self.host_id,
+                                     replace_message=interaction.message)
 
 
 class ChallengeAcceptView(discord.ui.View):
@@ -709,7 +727,8 @@ class ChallengeAcceptView(discord.ui.View):
             await interaction.response.send_message(
                 "You already have an active game! Finish or `/forfeit` it first.", ephemeral=True)
             return
-        await start_multiplayer_game(interaction, self.challenger_id)
+        await start_multiplayer_game(interaction, self.challenger_id,
+                                     replace_message=interaction.message)
 
     @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
     async def decline_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -749,10 +768,12 @@ class RematchView(discord.ui.View):
         self.disable_all_items()
         await interaction.message.edit(view=self)
 
+        # FIX: pass the current message so the new game overwrites it
         if s.is_campaign:
-            await start_campaign(interaction)
+            await start_campaign(interaction, replace_message=interaction.message)
         elif s.is_challenge and s.challenge_id:
-            await start_challenge(interaction, s.challenge_id)
+            await start_challenge(interaction, s.challenge_id,
+                                  replace_message=interaction.message)
         elif s.is_multiplayer and s.rematch_p2_id:
             # For multiplayer the second human must also not be in a game
             other_id = s.rematch_p2_id if uid == s.rematch_p1_id else s.rematch_p1_id
@@ -760,18 +781,22 @@ class RematchView(discord.ui.View):
                 await interaction.response.send_message(
                     "Your opponent is already in another game.", ephemeral=True)
                 return
-            # Re-use the direct challenge flow with original host = p1
+            # Post a rematch accept prompt — edit the current message
             view = ChallengeAcceptView(int(s.rematch_p1_id), int(s.rematch_p2_id))
-            if interaction.response.is_done():
-                await interaction.followup.send(
-                    f"🔄 **{interaction.user.display_name}** wants a rematch! "
-                    f"<@{other_id}> — accept?", view=view)
-            else:
-                await interaction.response.send_message(
-                    f"🔄 **{interaction.user.display_name}** wants a rematch! "
-                    f"<@{other_id}> — accept?", view=view)
+            rematch_content = (
+                f"🔄 **{interaction.user.display_name}** wants a rematch! "
+                f"<@{other_id}> — accept?")
+            try:
+                await interaction.message.edit(
+                    content=rematch_content, attachments=[], view=view)
+            except Exception:
+                if interaction.response.is_done():
+                    await interaction.followup.send(rematch_content, view=view)
+                else:
+                    await interaction.response.send_message(
+                        rematch_content, view=view)
         else:
-            await start_campaign(interaction)
+            await start_campaign(interaction, replace_message=interaction.message)
 
 
 # === Challenge Mode UI ===
@@ -869,11 +894,43 @@ async def setup_audio_for_session(session: GameSession, member: discord.Member):
         print(f"[Audio] {member.display_name} is not in a voice channel — no audio for this game.")
 
 
-async def start_campaign(interaction: discord.Interaction):
+# ─── Helper: send game board to a message (edit existing or send new) ─────────
+
+async def _send_or_replace(interaction: discord.Interaction,
+                           session: GameSession,
+                           content: str,
+                           replace_message: Optional[discord.Message] = None):
+    """Either edit *replace_message* to show the board, or send a new followup.
+
+    Guarantees that session.message is set to the resulting Message.
+    """
+    board_file = render_board_file(session)
+    view = GameView(session)
+
+    if replace_message:
+        try:
+            await replace_message.edit(
+                content=content, attachments=[board_file], view=view)
+            session.message = replace_message
+            return
+        except Exception as e:
+            print(f"[_send_or_replace] Edit failed ({e}), falling back to new message")
+            # File stream consumed — re-render
+            board_file = render_board_file(session)
+
+    msg = await interaction.followup.send(
+        content=content, file=board_file, view=view, wait=True)
+    session.message = msg
+
+
+async def start_campaign(interaction: discord.Interaction,
+                         replace_message: Optional[discord.Message] = None):
     user_id = str(interaction.user.id)
     if user_in_game(user_id):
-        await interaction.response.send_message(
-            "You already have an active game! Finish or `/forfeit` it first.", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "You already have an active game! Finish or `/forfeit` it first.",
+                ephemeral=True)
         return
 
     user = interaction.user
@@ -910,20 +967,18 @@ async def start_campaign(interaction: discord.Interaction):
     if isinstance(user, discord.Member):
         await setup_audio_for_session(session, user)
 
-    await interaction.response.defer()
+    if not interaction.response.is_done():
+        await interaction.response.defer()
 
     # Play battle start audio
     await try_play_audio(session, audio_manager.play_battle_start(guild_id))
-
-    board_file = render_board_file(session)
-    view = GameView(session)
 
     stage_text = f"**Campaign Stage {stage + 1}/{get_total_campaign_stages()}**"
     enemy_text = f"**VS {enemy_def.name}** (Rank {enemy_def.rank} - Life: {enemy_def.life})"
     content = f"📖 {stage_text}\n{enemy_text}"
 
-    msg = await interaction.followup.send(content=content, file=board_file, view=view, wait=True)
-    session.message = msg
+    await _send_or_replace(interaction, session, content,
+                           replace_message=replace_message)
     start_turn_timer(session)
 
 
@@ -950,17 +1005,21 @@ async def show_challenge_select(interaction: discord.Interaction):
         "⚔️ **Challenge Mode** — Select a challenge to begin:", view=view, ephemeral=True)
 
 
-async def start_challenge(interaction: discord.Interaction, challenge_id: str):
+async def start_challenge(interaction: discord.Interaction, challenge_id: str,
+                          replace_message: Optional[discord.Message] = None):
     """Start a challenge game from a selection interaction."""
     user_id = str(interaction.user.id)
     if user_in_game(user_id):
-        await interaction.response.send_message(
-            "You already have an active game! Finish or `/forfeit` it first.", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "You already have an active game! Finish or `/forfeit` it first.",
+                ephemeral=True)
         return
 
     challenge = get_challenge_by_id(challenge_id)
     if not challenge:
-        await interaction.response.send_message("Challenge not found!", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Challenge not found!", ephemeral=True)
         return
 
     user = interaction.user
@@ -987,7 +1046,7 @@ async def start_challenge(interaction: discord.Interaction, challenge_id: str):
     # Build game state
     game_state = GameState(human, bot_player)
     game_state.game_id = str(uuid.uuid4())
-    game_state.turn_limit = challenge.player.turn_limit  # Player config holds turn limit
+    game_state.turn_limit = challenge.player.turn_limit
     engine = GameEngine(game_state)
 
     difficulty = BotAI.get_difficulty_for_rank(challenge.bot.rank)
@@ -1008,11 +1067,10 @@ async def start_challenge(interaction: discord.Interaction, challenge_id: str):
     if isinstance(user, discord.Member):
         await setup_audio_for_session(session, user)
 
-    await interaction.response.defer(ephemeral=True)
-    await try_play_audio(session, audio_manager.play_battle_start(guild_id))
+    if not interaction.response.is_done():
+        await interaction.response.defer()
 
-    board_file = render_board_file(session)
-    view = GameView(session)
+    await try_play_audio(session, audio_manager.play_battle_start(guild_id))
 
     turn_info = (f" | ⏳ Turn Limit: {challenge.player.turn_limit}" if challenge.player.turn_limit else "")
     actions_info = (f" | ⚡ {challenge.player.actions_per_turn} actions/turn"
@@ -1022,34 +1080,64 @@ async def start_challenge(interaction: discord.Interaction, challenge_id: str):
                f"VS **{challenge.bot.name}** (Rank {challenge.bot.rank})"
                f"{turn_info}{actions_info}")
 
-    # Send to the channel (not ephemeral) so both can see it
-    channel = bot.get_channel(interaction.channel_id)
-    if channel:
-        msg = await channel.send(content=content, file=board_file, view=view)
-        session.message = msg
-        start_turn_timer(session)
+    if replace_message:
+        # Rematch path — overwrite the previous end-screen
+        await _send_or_replace(interaction, session, content,
+                               replace_message=replace_message)
+    else:
+        # Fresh challenge from dropdown — send to channel (not ephemeral)
+        board_file = render_board_file(session)
+        view = GameView(session)
+        channel = bot.get_channel(interaction.channel_id)
+        if channel:
+            msg = await channel.send(content=content, file=board_file, view=view)
+            session.message = msg
+
+    start_turn_timer(session)
 
 
-async def create_multiplayer_lobby(interaction: discord.Interaction):
+async def create_multiplayer_lobby(interaction: discord.Interaction,
+                                   replace_message: Optional[discord.Message] = None):
     user_id = str(interaction.user.id)
     if user_in_game(user_id):
-        await interaction.response.send_message(
-            "You already have an active game! Finish or `/forfeit` it first.", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "You already have an active game! Finish or `/forfeit` it first.",
+                ephemeral=True)
         return
     for lobby in active_lobbies.values():
         if lobby.host_id == interaction.user.id:
-            await interaction.response.send_message("You already have an open lobby!", ephemeral=True)
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "You already have an open lobby!", ephemeral=True)
             return
 
     lobby = LobbyInfo(interaction.user.id, interaction.user.display_name, interaction.channel_id)
     active_lobbies[interaction.user.id] = lobby
     view = MultiplayerLobbyView(interaction.user.id)
-    await interaction.response.send_message(
-        f"⚔️ **{interaction.user.display_name}** is looking for a challenger!\nClick **Join Game** to accept.",
-        view=view)
+    lobby_content = (
+        f"⚔️ **{interaction.user.display_name}** is looking for a challenger!\n"
+        f"Click **Join Game** to accept.")
+
+    if replace_message:
+        # Edit the menu message to become the lobby
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+            await replace_message.edit(
+                content=lobby_content, attachments=[], view=view)
+        except Exception:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    lobby_content, view=view)
+            else:
+                await interaction.followup.send(lobby_content, view=view)
+    else:
+        await interaction.response.send_message(lobby_content, view=view)
 
 
-async def start_multiplayer_game(interaction: discord.Interaction, host_id: int):
+async def start_multiplayer_game(interaction: discord.Interaction, host_id: int,
+                                 replace_message: Optional[discord.Message] = None):
     active_lobbies.pop(host_id, None)
 
     host = await bot.fetch_user(host_id)
@@ -1086,15 +1174,14 @@ async def start_multiplayer_game(interaction: discord.Interaction, host_id: int)
     if isinstance(interaction.user, discord.Member):
         await setup_audio_for_session(session, interaction.user)
 
-    await interaction.response.defer()
+    if not interaction.response.is_done():
+        await interaction.response.defer()
+
     await try_play_audio(session, audio_manager.play_battle_start(guild_id))
 
-    board_file = render_board_file(session)
-    view = GameView(session)
-
     content = f"⚔️ **{host.display_name}** vs **{challenger.display_name}**"
-    msg = await interaction.followup.send(content=content, file=board_file, view=view, wait=True)
-    session.message = msg
+    await _send_or_replace(interaction, session, content,
+                           replace_message=replace_message)
     start_turn_timer(session)
 
 
@@ -1307,108 +1394,119 @@ async def _check_insanity_audio(session: GameSession, result: TurnResult):
 
 
 async def handle_game_over(session: GameSession, result: TurnResult):
+    """Process end-of-game: show results, award XP, clean up.
+
+    Uses try/finally to guarantee session cleanup and voice disconnect
+    even if an error occurs during rendering or persistence.
+    """
     gs = session.game_state
     log_text = "\n".join(result.messages)
-    rematch_view = RematchView(session)
 
     # Cancel the turn timer — game is over
     cancel_turn_timer(session)
 
-    # Play battle end audio
-    await try_play_audio(session,
-        audio_manager.play_battle_end(session.guild_id))
+    try:
+        # Play battle end audio
+        await try_play_audio(session,
+            audio_manager.play_battle_end(session.guild_id))
 
-    if gs.is_draw:
-        board_file = render_board_file(session)
-        await update_game_message(
-            session, f"📜 {log_text}\n\n🤝 **DRAW!**",
-            file=board_file, view=rematch_view
-        )
-        for p in [gs.player1, gs.player2]:
-            if not p.is_bot:
-                record_draw(p.user_id)
-        unregister_session(session)
+        rematch_view = RematchView(session)
 
-        if session.audio_active and session.guild_id:
-            await asyncio.sleep(5)
-            await audio_manager.disconnect(session.guild_id)
-        return
-
-    winner = gs.winner
-    loser = gs.player1 if winner == gs.player2 else gs.player2
-
-    if not winner.is_bot:
-        xp_data = session.engine.calculate_xp(winner)
-        rank_data = add_xp(winner.user_id, xp_data["total"])
-        record_win(winner.user_id)
-
-        if session.is_campaign:
-            advance_campaign(winner.user_id)
-
-        if session.is_challenge and session.challenge_id:
-            mark_challenge_completed(winner.user_id, session.challenge_id)
-
-        # Assign rank role
-        if session.guild_id:
-            guild = bot.get_guild(session.guild_id)
-            if guild:
-                try:
-                    member = await guild.fetch_member(int(winner.user_id))
-                    await assign_rank_role(member, rank_data["new_rank"])
-                except Exception as e:
-                    print(f"[RoleManager] Could not assign role to {winner.user_id}: {e}")
-
-        end_bytes = compositor.render_end_screen(winner, xp_data, rank_data)
-        end_file = discord.File(io.BytesIO(end_bytes), filename="results.png")
-
-        content = f"📜 {log_text}\n\n🏆 **{winner.display_name}** is victorious!"
-        if rank_data["ranked_up"]:
-            new_rank_name = rank_data["new_rank_name"]
-            new_rank_num  = rank_data["new_rank"]
-            content += f"\n🎉 Ranked up to **Rank {new_rank_num} — {new_rank_name}**!"
-            await post_announcement(
-                f"🎉 <@{winner.user_id}> has ranked up to **Rank {new_rank_num} — {new_rank_name}**!"
-            )
-
-        await update_game_message(session, content, file=end_file, view=rematch_view)
-
-    else:
-        # Winner is bot — human loser
-        if not loser.is_bot:
-            xp_data = session.engine.calculate_xp(loser)
-            xp_data["total"] = 0
-            loser_player_data = load_player_data(loser.user_id)
-            rank_data = {
-                "old_rank": loser_player_data["rank"],
-                "new_rank": loser_player_data["rank"],
-                "ranked_up": False,
-                "old_rank_name": RANK_NAMES.get(loser_player_data["rank"], ""),
-                "new_rank_name": RANK_NAMES.get(loser_player_data["rank"], ""),
-                "total_xp": loser_player_data["xp"],
-            }
-            end_bytes = compositor.render_end_screen(loser, xp_data, rank_data, is_loss=True)
-            end_file = discord.File(io.BytesIO(end_bytes), filename="results.png")
-            await update_game_message(
-                session,
-                f"📜 {log_text}\n\n💀 **{winner.display_name}** wins! Better luck next time!",
-                file=end_file, view=rematch_view
-            )
-        else:
+        if gs.is_draw:
             board_file = render_board_file(session)
             await update_game_message(
-                session,
-                f"📜 {log_text}\n\n💀 **{winner.display_name}** wins!",
+                session, f"📜 {log_text}\n\n🤝 **DRAW!**",
                 file=board_file, view=rematch_view
             )
+            for p in [gs.player1, gs.player2]:
+                if not p.is_bot:
+                    record_draw(p.user_id)
+            return
 
-    if not loser.is_bot:
-        record_loss(loser.user_id)
+        winner = gs.winner
+        loser = gs.player1 if winner == gs.player2 else gs.player2
 
-    unregister_session(session)
+        if not winner.is_bot:
+            xp_data = session.engine.calculate_xp(winner)
+            rank_data = add_xp(winner.user_id, xp_data["total"])
+            record_win(winner.user_id)
 
-    if session.audio_active and session.guild_id:
-        await asyncio.sleep(5)
-        await audio_manager.disconnect(session.guild_id)
+            if session.is_campaign:
+                advance_campaign(winner.user_id)
+
+            if session.is_challenge and session.challenge_id:
+                mark_challenge_completed(winner.user_id, session.challenge_id)
+
+            # Assign rank role
+            if session.guild_id:
+                guild = bot.get_guild(session.guild_id)
+                if guild:
+                    try:
+                        member = await guild.fetch_member(int(winner.user_id))
+                        await assign_rank_role(member, rank_data["new_rank"])
+                    except Exception as e:
+                        print(f"[RoleManager] Could not assign role to {winner.user_id}: {e}")
+
+            end_bytes = compositor.render_end_screen(winner, xp_data, rank_data)
+            end_file = discord.File(io.BytesIO(end_bytes), filename="results.png")
+
+            content = f"📜 {log_text}\n\n🏆 **{winner.display_name}** is victorious!"
+            if rank_data["ranked_up"]:
+                new_rank_name = rank_data["new_rank_name"]
+                new_rank_num  = rank_data["new_rank"]
+                content += f"\n🎉 Ranked up to **Rank {new_rank_num} — {new_rank_name}**!"
+                await post_announcement(
+                    f"🎉 <@{winner.user_id}> has ranked up to **Rank {new_rank_num} — {new_rank_name}**!"
+                )
+
+            await update_game_message(session, content, file=end_file, view=rematch_view)
+
+        else:
+            # Winner is bot — human loser
+            if not loser.is_bot:
+                xp_data = session.engine.calculate_xp(loser)
+                xp_data["total"] = 0
+                loser_player_data = load_player_data(loser.user_id)
+                rank_data = {
+                    "old_rank": loser_player_data["rank"],
+                    "new_rank": loser_player_data["rank"],
+                    "ranked_up": False,
+                    "old_rank_name": RANK_NAMES.get(loser_player_data["rank"], ""),
+                    "new_rank_name": RANK_NAMES.get(loser_player_data["rank"], ""),
+                    "total_xp": loser_player_data["xp"],
+                }
+                end_bytes = compositor.render_end_screen(loser, xp_data, rank_data, is_loss=True)
+                end_file = discord.File(io.BytesIO(end_bytes), filename="results.png")
+                await update_game_message(
+                    session,
+                    f"📜 {log_text}\n\n💀 **{winner.display_name}** wins! Better luck next time!",
+                    file=end_file, view=rematch_view
+                )
+            else:
+                board_file = render_board_file(session)
+                await update_game_message(
+                    session,
+                    f"📜 {log_text}\n\n💀 **{winner.display_name}** wins!",
+                    file=board_file, view=rematch_view
+                )
+
+        if not loser.is_bot:
+            record_loss(loser.user_id)
+
+    except Exception as e:
+        print(f"[handle_game_over] Error during game-over processing: {e}")
+        import traceback
+        traceback.print_exc()
+
+    finally:
+        # FIX: ALWAYS clean up the session and disconnect voice, even on error
+        unregister_session(session)
+        if session.audio_active and session.guild_id:
+            try:
+                await asyncio.sleep(3)
+                await audio_manager.disconnect(session.guild_id)
+            except Exception as e:
+                print(f"[handle_game_over] Error disconnecting audio: {e}")
 
 
 # === Slash Commands ===
@@ -1585,8 +1683,6 @@ async def leaderboard_command(interaction: discord.Interaction, top: int = 10):
     app_commands.Choice(name="off", value="off"),
 ])
 async def audio_command(interaction: discord.Interaction, setting: str):
-    # Store preference per-user in memory for the session
-    # (A persistent per-user flag can be added to player data if desired later)
     uid = interaction.user.id
     if setting == "off":
         _audio_disabled_users.add(uid)
