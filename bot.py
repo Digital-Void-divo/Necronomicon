@@ -42,6 +42,7 @@ from guide import send_guide
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.voice_states = True   # Explicit — required to see member.voice
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 compositor = ImageCompositor()
@@ -379,6 +380,13 @@ class MainMenuView(discord.ui.View):
 
 
 class GameView(discord.ui.View):
+    """Main in-game button layout.
+
+    Row 0: Play card buttons (up to 4) + View Hand
+    Row 1: [Play 5 overflow if needed] + Discard + Timer + Guide + Forfeit
+    Row 2: Taunt buttons
+    """
+
     def __init__(self, session: GameSession):
         super().__init__(timeout=600)
         self.session = session
@@ -388,16 +396,23 @@ class GameView(discord.ui.View):
         if current.is_bot:
             return
 
-        # Row 0: Play card buttons (up to 5)
-        for i in range(len(current.hand)):
-            can_play, _ = current.can_play_card(i)
-            self.add_item(PlayCardButton(session, i, can_play))
+        hand_size = len(current.hand)
 
-        # Row 1: View Hand | Discard | Check Timer | Guide
-        self.add_item(ViewHandButton(session))
+        # Row 0: Play card buttons (up to 4) + View Hand on the right
+        row0_count = min(hand_size, 4)
+        for i in range(row0_count):
+            can_play, _ = current.can_play_card(i)
+            self.add_item(PlayCardButton(session, i, can_play, row=0))
+        self.add_item(ViewHandButton(session, row=0))
+
+        # Row 1: Overflow Play 5 (if hand > 4) + Discard + Timer + Guide + Forfeit
+        if hand_size > 4:
+            can_play, _ = current.can_play_card(4)
+            self.add_item(PlayCardButton(session, 4, can_play, row=1))
         self.add_item(DiscardSelectButton(session))
         self.add_item(CheckTimerButton(session))
         self.add_item(InGameGuideButton())
+        self.add_item(ForfeitButton(session))
 
         # Row 2: Taunt buttons (available to all players in this game, not turn-locked)
         self.add_item(TauntButton(session, "taunt"))
@@ -407,8 +422,8 @@ class GameView(discord.ui.View):
 
 
 class ViewHandButton(discord.ui.Button):
-    def __init__(self, session: GameSession):
-        super().__init__(label="View Hand", style=discord.ButtonStyle.secondary, emoji="👁️", row=1)
+    def __init__(self, session: GameSession, row: int = 0):
+        super().__init__(label="View Hand", style=discord.ButtonStyle.secondary, emoji="👁️", row=row)
         self.session = session
 
     async def callback(self, interaction: discord.Interaction):
@@ -444,10 +459,10 @@ class ViewHandButton(discord.ui.Button):
 
 
 class PlayCardButton(discord.ui.Button):
-    def __init__(self, session: GameSession, index: int, can_play: bool):
+    def __init__(self, session: GameSession, index: int, can_play: bool, row: int = 0):
         label = f"Play {index + 1}"
         style = discord.ButtonStyle.success if can_play else discord.ButtonStyle.secondary
-        super().__init__(label=label, style=style, disabled=not can_play, row=0)
+        super().__init__(label=label, style=style, disabled=not can_play, row=row)
         self.session = session
         self.card_index = index
 
@@ -497,6 +512,85 @@ class CheckTimerButton(discord.ui.Button):
         else:
             msg = f"⏱ **{player_name}** has **{mins}:{secs:02d}** remaining."
         await interaction.response.send_message(msg, ephemeral=True)
+
+
+class ForfeitButton(discord.ui.Button):
+    """In-game forfeit button with confirmation prompt."""
+
+    def __init__(self, session: GameSession):
+        super().__init__(label="Forfeit", style=discord.ButtonStyle.danger, emoji="🏳️", row=1)
+        self.session = session
+
+    async def callback(self, interaction: discord.Interaction):
+        gs = self.session.game_state
+        user_id = str(interaction.user.id)
+
+        # Only players in this game may forfeit
+        if user_id not in (gs.player1.user_id, gs.player2.user_id):
+            await interaction.response.send_message(
+                "You're not in this game!", ephemeral=True)
+            return
+
+        # Show confirmation prompt
+        confirm_view = ForfeitConfirmView(self.session, interaction.user.id)
+        await interaction.response.send_message(
+            "⚠️ **Are you sure you want to forfeit?** This will count as a loss.",
+            view=confirm_view, ephemeral=True)
+
+
+class ForfeitConfirmView(discord.ui.View):
+    """Ephemeral confirmation dialog for forfeit."""
+
+    def __init__(self, session: GameSession, user_id: int):
+        super().__init__(timeout=30)
+        self.session = session
+        self.user_id = user_id
+
+    @discord.ui.button(label="Yes, Forfeit", style=discord.ButtonStyle.danger, emoji="🏳️")
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your prompt!", ephemeral=True)
+            return
+
+        session = self.session
+        gs = session.game_state
+
+        # Check if game is still active
+        if gs.game_over:
+            await interaction.response.send_message("This game is already over.", ephemeral=True)
+            self.stop()
+            return
+
+        user_id = str(interaction.user.id)
+        if user_id == gs.player1.user_id:
+            gs.winner = gs.player2
+        else:
+            gs.winner = gs.player1
+        gs.game_over = True
+
+        forfeit_result = TurnResult()
+        forfeit_result.game_over = True
+        forfeit_result.messages.append(f"🏳️ **{interaction.user.display_name}** forfeits!")
+        forfeit_result.game_over_messages.append(
+            f"🏆 **{gs.winner.display_name}** wins by forfeit!")
+        forfeit_result.messages.extend(forfeit_result.game_over_messages)
+
+        # Disable the confirmation buttons
+        self.disable_all_items()
+        await interaction.response.edit_message(content="🏳️ Forfeiting...", view=self)
+        self.stop()
+
+        await handle_game_over(session, forfeit_result)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your prompt!", ephemeral=True)
+            return
+
+        self.disable_all_items()
+        await interaction.response.edit_message(content="Forfeit cancelled.", view=self)
+        self.stop()
 
 
 _TAUNT_CONFIG = {
@@ -736,15 +830,43 @@ class ChallengeSelectDropdown(discord.ui.Select):
 _audio_disabled_users: set[int] = set()
 
 
+async def _resolve_member_voice(member: discord.Member) -> discord.Member:
+    """Ensure the member object has up-to-date voice state.
+
+    Button/interaction member objects can sometimes have stale or missing
+    voice state if the gateway cache hasn't caught up.  Re-fetching from
+    the guild guarantees we get the current voice info.
+    """
+    if member.voice is not None:
+        return member
+    # Voice state missing from cache — try a fresh fetch
+    try:
+        fresh = await member.guild.fetch_member(member.id)
+        # fetch_member doesn't always include voice; fall back to cache lookup
+        cached = member.guild.get_member(member.id)
+        if cached and cached.voice:
+            return cached
+        return fresh
+    except Exception:
+        return member
+
+
 async def setup_audio_for_session(session: GameSession, member: discord.Member):
     """If the member is in a voice channel and hasn't disabled audio, join and mark active."""
     if member.id in _audio_disabled_users:
+        print(f"[Audio] {member.display_name} has audio disabled — skipping.")
         return
+
+    # Make sure we have current voice state
+    member = await _resolve_member_voice(member)
+
     if member.voice and member.voice.channel:
         vc = await audio_manager.try_join_voice(member)
         if vc:
             session.audio_active = True
             session.guild_id = member.guild.id
+    else:
+        print(f"[Audio] {member.display_name} is not in a voice channel — no audio for this game.")
 
 
 async def start_campaign(interaction: discord.Interaction):
@@ -1300,8 +1422,9 @@ async def play_command(interaction: discord.Interaction):
 
     # Play menu audio if in voice
     if interaction.guild and isinstance(interaction.user, discord.Member):
-        if interaction.user.voice and interaction.user.voice.channel:
-            vc = await audio_manager.try_join_voice(interaction.user)
+        member = await _resolve_member_voice(interaction.user)
+        if member.voice and member.voice.channel:
+            vc = await audio_manager.try_join_voice(member)
             if vc:
                 await audio_manager.play_menu_start(interaction.guild.id)
 
@@ -1386,25 +1509,12 @@ async def forfeit_command(interaction: discord.Interaction):
         return
 
     session = get_session_for_user(user_id)
-    gs = session.game_state
 
-    if user_id == gs.player1.user_id:
-        gs.winner = gs.player2
-    else:
-        gs.winner = gs.player1
-    gs.game_over = True
-
-    forfeit_result = TurnResult()
-    forfeit_result.game_over = True
-    forfeit_result.messages.append(f"🏳️ **{interaction.user.display_name}** forfeits!")
-    forfeit_result.game_over_messages.append(
-        f"🏆 **{gs.winner.display_name}** wins by forfeit!")
-    forfeit_result.messages.extend(forfeit_result.game_over_messages)
-
-    await interaction.response.defer()
-
-    # Directly handle game over — skip post_turn_result to avoid "thinking" state
-    await handle_game_over(session, forfeit_result)
+    # Show confirmation before forfeiting
+    confirm_view = ForfeitConfirmView(session, interaction.user.id)
+    await interaction.response.send_message(
+        "⚠️ **Are you sure you want to forfeit?** This will count as a loss.",
+        view=confirm_view, ephemeral=True)
 
 
 @bot.tree.command(name="cardlist", description="View all available cards")
@@ -1587,6 +1697,9 @@ async def sync_all_roles_command(interaction: discord.Interaction):
 @bot.event
 async def on_ready():
     print(f"🎮 Necronomicon bot is online as {bot.user}")
+    print(f"[Bot] Intents: voice_states={bot.intents.voice_states}, "
+          f"members={bot.intents.members}, "
+          f"message_content={bot.intents.message_content}")
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} commands.")
