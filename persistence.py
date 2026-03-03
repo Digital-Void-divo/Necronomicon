@@ -107,8 +107,10 @@ def record_draw(user_id: str):
 
 def get_all_player_data() -> list[dict]:
     """Return a list of all player data dicts, each augmented with user_id."""
-    _ensure_dir()
+    _ensure_data_dir()
     results = []
+    if not os.path.isdir(PLAYER_DATA_DIR):
+        return results
     for fname in os.listdir(PLAYER_DATA_DIR):
         if not fname.endswith(".json"):
             continue
