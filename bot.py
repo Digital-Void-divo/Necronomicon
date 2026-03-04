@@ -579,20 +579,16 @@ class ForfeitConfirmView(discord.ui.View):
             f"🏆 **{gs.winner.display_name}** wins by forfeit!")
         forfeit_result.messages.extend(forfeit_result.game_over_messages)
 
-        # FIX: Acknowledge the interaction safely, then process game over
         self.disable_all_items()
-        try:
-            await interaction.response.edit_message(content="🏳️ Forfeiting...", view=self)
-        except Exception:
-            # If the ephemeral timed out, try sending a new ephemeral
-            try:
-                await interaction.response.send_message("🏳️ Forfeiting...", ephemeral=True)
-            except Exception:
-                pass  # Interaction is dead — proceed with cleanup anyway
         self.stop()
 
-        # FIX: Always attempt game-over processing; handle_game_over has its
-        # own try/finally that guarantees cleanup even on error.
+        # Defer immediately — this is the only reliable way to acknowledge
+        # an ephemeral button interaction without risking "interaction failed".
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass  # Already responded somehow — proceed anyway
+
         try:
             await handle_game_over(session, forfeit_result)
         except Exception as e:
@@ -645,6 +641,10 @@ class TauntButton(discord.ui.Button):
         await interaction.response.send_message(
             f"**{sender.display_name}:** *{text}*")
 
+        # Play taunt audio in voice channel if active
+        await try_play_audio(self.session,
+            audio_manager.play_taunt(self.session.guild_id, self.taunt_type))
+
 
 class DiscardChoiceView(discord.ui.View):
     def __init__(self, session: GameSession):
@@ -665,6 +665,14 @@ class DiscardSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         idx = int(self.values[0])
+        # Dismiss the ephemeral select immediately so it doesn't linger
+        try:
+            await interaction.response.edit_message(content="✅ Discarding...", view=None)
+        except Exception:
+            try:
+                await interaction.response.defer(ephemeral=True)
+            except Exception:
+                pass
         await handle_discard_card(interaction, self.session, idx)
 
 
@@ -689,7 +697,13 @@ class BlackmailSelect(discord.ui.Select):
             result = self.session.engine.resolve_blackmail_choice(idx)
             self.session.awaiting_blackmail = False
             self.session.blackmail_target_id = None
-            await interaction.response.send_message("You discarded a card.", ephemeral=True)
+            try:
+                await interaction.response.edit_message(content="✅ Card discarded.", view=None)
+            except Exception:
+                try:
+                    await interaction.response.send_message("You discarded a card.", ephemeral=True)
+                except Exception:
+                    pass
             await post_turn_result(self.session, result)
 
 
@@ -797,6 +811,35 @@ class RematchView(discord.ui.View):
                         rematch_content, view=view)
         else:
             await start_campaign(interaction, replace_message=interaction.message)
+
+    @discord.ui.button(label="📖 Main Menu", style=discord.ButtonStyle.secondary)
+    async def main_menu_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = str(interaction.user.id)
+        s = self.session
+
+        valid_ids = [i for i in [s.rematch_p1_id, s.rematch_p2_id] if i]
+        if uid not in valid_ids:
+            await interaction.response.send_message(
+                "You weren't in this game.", ephemeral=True)
+            return
+
+        if user_in_game(uid):
+            await interaction.response.send_message(
+                "You already have an active game!", ephemeral=True)
+            return
+
+        self.disable_all_items()
+        menu_bytes = compositor.render_menu()
+        menu_file = discord.File(io.BytesIO(menu_bytes), filename="menu.png")
+        view = MainMenuView(owner_id=interaction.user.id)
+        try:
+            await interaction.response.edit_message(
+                content="", attachments=[menu_file], view=view)
+        except Exception:
+            if interaction.response.is_done():
+                await interaction.followup.send(file=menu_file, view=view)
+            else:
+                await interaction.response.send_message(file=menu_file, view=view)
 
 
 # === Challenge Mode UI ===
@@ -1275,15 +1318,15 @@ async def handle_discard_card(interaction: discord.Interaction, session: GameSes
     gs = session.game_state
     user_id = str(interaction.user.id)
     if gs.current_player.user_id != user_id:
-        await interaction.response.send_message("It's not your turn!", ephemeral=True)
+        try:
+            await interaction.response.send_message("It's not your turn!", ephemeral=True)
+        except Exception:
+            pass
         return
 
     async with session.lock:
         result = session.engine.discard_card(card_index)
-        try:
-            await interaction.response.defer()
-        except discord.InteractionResponded:
-            pass
+        # Interaction was already acknowledged by DiscardSelect.callback — no defer needed
         await post_turn_result(session, result)
 
 
