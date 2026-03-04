@@ -559,40 +559,32 @@ class ForfeitConfirmView(discord.ui.View):
         session = self.session
         gs = session.game_state
 
-        # Check if game is still active
         if gs.game_over:
             await interaction.response.send_message("This game is already over.", ephemeral=True)
             self.stop()
             return
 
-        user_id = str(interaction.user.id)
-        if user_id == gs.player1.user_id:
-            gs.winner = gs.player2
-        else:
-            gs.winner = gs.player1
-        gs.game_over = True
-
-        forfeit_result = TurnResult()
-        forfeit_result.game_over = True
-        forfeit_result.messages.append(f"🏳️ **{interaction.user.display_name}** forfeits!")
-        forfeit_result.game_over_messages.append(
-            f"🏆 **{gs.winner.display_name}** wins by forfeit!")
-        forfeit_result.messages.extend(forfeit_result.game_over_messages)
-
         self.disable_all_items()
         self.stop()
 
-        # Defer immediately — this is the only reliable way to acknowledge
-        # an ephemeral button interaction without risking "interaction failed".
-        try:
-            await interaction.response.defer(ephemeral=True)
-        except Exception:
-            pass  # Already responded somehow — proceed anyway
+        await interaction.response.edit_message(content="🏳️ Forfeiting...", view=self)
+
+        # Deal 999 damage to the forfeiter — runs through normal loss logic
+        user_id = str(interaction.user.id)
+        forfeiter = gs.player1 if user_id == gs.player1.user_id else gs.player2
+        forfeiter.life = -999
+
+        result = TurnResult()
+        result.messages.append(f"🏳️ **{forfeiter.display_name}** forfeits!")
+        game_over_msgs = gs.check_game_over()
+        result.messages.extend(game_over_msgs)
+        result.game_over = gs.game_over
+        result.game_over_messages = game_over_msgs
 
         try:
-            await handle_game_over(session, forfeit_result)
+            await post_turn_result(session, result)
         except Exception as e:
-            print(f"[Forfeit] Error in handle_game_over: {e}")
+            print(f"[Forfeit] Error in post_turn_result: {e}")
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
