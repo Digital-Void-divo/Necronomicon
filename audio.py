@@ -23,6 +23,7 @@ from config import (
     AUDIO_MENU_START, AUDIO_MONSTER_ATTACK, AUDIO_PHYSICAL_ATTACK,
     AUDIO_MAGICAL_ATTACK, AUDIO_NON_ATTACK, AUDIO_BATTLE_START,
     AUDIO_BATTLE_END, AUDIO_INSANITY,
+    AUDIO_TAUNT, AUDIO_CONGRATULATE, AUDIO_BEG, AUDIO_GOOD_GAME,
     PHYSICAL_ATTACK_CARDS, MAGICAL_ATTACK_CARDS, NON_ATTACK_CARDS,
     SUMMON_CARDS,
 )
@@ -275,6 +276,17 @@ class AudioManager:
 
     async def play_insanity(self, guild_id: int):
         await self.play_sound(guild_id, AUDIO_INSANITY)
+
+    async def play_taunt(self, guild_id: int, taunt_type: str = "taunt"):
+        """Play the appropriate sound for a taunt type."""
+        audio_map = {
+            "taunt":       AUDIO_TAUNT,
+            "congratulate": AUDIO_CONGRATULATE,
+            "beg":         AUDIO_BEG,
+            "gg":          AUDIO_GOOD_GAME,
+        }
+        path = audio_map.get(taunt_type, AUDIO_TAUNT)
+        await self.play_sound(guild_id, path)
 
     async def play_card_sound(self, guild_id: int, card_id: str):
         """Play the appropriate sound for a card being played."""
