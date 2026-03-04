@@ -381,31 +381,47 @@ class ImageCompositor:
 
     def render_hand(self, player: Player) -> bytes:
         if not player.hand:
-            im = Image.new("RGBA", (600, 200), (30, 20, 15, 255))
+            im = Image.new("RGBA", (600, 200), (18, 10, 8, 255))
             d = ImageDraw.Draw(im)
+            d.rectangle([(2, 2), (597, 197)], outline=(80, 55, 30, 200), width=2)
             d.text((180, 80), "No cards in hand",
-                   fill=(200, 200, 200), font=self._font(20))
+                   fill=(160, 140, 110), font=self._font(20))
         else:
-            cw, ch = 150, 210
-            sp = 12
-            pad = 20
+            # Larger cards for legibility
+            cw, ch = 200, 280
+            sp = 14
+            pad = 22
             tw = len(player.hand) * (cw + sp) - sp + pad * 2
-            th = ch + 50 + pad * 2
+            th = ch + 54 + pad * 2
 
+            # Rich dark background — load file or build one
             bg = self._load(HAND_BG_PATH, (tw, th))
-            im = bg if bg else Image.new("RGBA", (tw, th), (30, 20, 15, 240))
+            if bg is None:
+                bg = Image.new("RGBA", (tw, th), (14, 8, 5, 255))
+                d_bg = ImageDraw.Draw(bg)
+                # Outer border
+                d_bg.rectangle([(0, 0), (tw - 1, th - 1)],
+                                outline=(90, 60, 30, 220), width=3)
+                # Inner subtle border
+                d_bg.rectangle([(5, 5), (tw - 6, th - 6)],
+                                outline=(55, 35, 18, 150), width=1)
+            im = bg.copy() if bg else bg
             d = ImageDraw.Draw(im)
+
             nf = self._font(self._fs(FONT_SIZE_HAND_NUMBER))
+            desc_f = self._font(max(9, self._fs(11)))
 
             for i, card in enumerate(player.hand):
                 ci = self._card_face(card.card_id, cw, ch)
                 x = pad + i * (cw + sp)
                 im.paste(ci, (x, pad), ci)
+
+                # Card number label
                 lbl = f"[{i + 1}]"
                 bb = d.textbbox((0, 0), lbl, font=nf)
-                lx = x + (cw - bb[2] + bb[0]) // 2
+                lx = x + (cw - (bb[2] - bb[0])) // 2
                 self._shadow_text(d, (lx, pad + ch + 8), lbl, nf,
-                                  (200, 200, 100))
+                                  (210, 190, 80))
 
         buf = io.BytesIO()
         im.save(buf, format="PNG")
