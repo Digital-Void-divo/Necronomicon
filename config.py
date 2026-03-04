@@ -212,6 +212,10 @@ AUDIO_NON_ATTACK     = f"{AUDIO_DIR}/non_attack.mp3"
 AUDIO_BATTLE_START   = f"{AUDIO_DIR}/battle_start.mp3"
 AUDIO_BATTLE_END     = f"{AUDIO_DIR}/battle_end.mp3"
 AUDIO_INSANITY       = f"{AUDIO_DIR}/insanity.mp3"
+AUDIO_TAUNT          = f"{AUDIO_DIR}/taunt.mp3"
+AUDIO_CONGRATULATE   = f"{AUDIO_DIR}/congratulate.mp3"
+AUDIO_BEG            = f"{AUDIO_DIR}/beg.mp3"
+AUDIO_GOOD_GAME      = f"{AUDIO_DIR}/good_game.mp3"
 
 PHYSICAL_ATTACK_CARDS = {
     "blast_em", "tommy_gun", "raid", "sacrificial_lamb",
