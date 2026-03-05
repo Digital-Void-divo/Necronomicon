@@ -519,7 +519,7 @@ class CheckTimerButton(discord.ui.Button):
 
 
 class ForfeitButton(discord.ui.Button):
-    """In-game forfeit button with confirmation prompt."""
+    """In-game forfeit button — immediately ends the game."""
 
     def __init__(self, session: GameSession):
         super().__init__(label="Forfeit", style=discord.ButtonStyle.danger, emoji="🏳️", row=1)
@@ -529,48 +529,19 @@ class ForfeitButton(discord.ui.Button):
         gs = self.session.game_state
         user_id = str(interaction.user.id)
 
-        # Only players in this game may forfeit
         if user_id not in (gs.player1.user_id, gs.player2.user_id):
-            await interaction.response.send_message(
-                "You're not in this game!", ephemeral=True)
+            await interaction.response.send_message("You're not in this game!", ephemeral=True)
             return
-
-        # Show confirmation prompt
-        confirm_view = ForfeitConfirmView(self.session, interaction.user.id)
-        await interaction.response.send_message(
-            "⚠️ **Are you sure you want to forfeit?** This will count as a loss.",
-            view=confirm_view, ephemeral=True)
-
-
-class ForfeitConfirmView(discord.ui.View):
-    """Ephemeral confirmation dialog for forfeit."""
-
-    def __init__(self, session: GameSession, user_id: int):
-        super().__init__(timeout=30)
-        self.session = session
-        self.user_id = user_id
-
-    @discord.ui.button(label="Yes, Forfeit", style=discord.ButtonStyle.danger, emoji="🏳️")
-    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("This isn't your prompt!", ephemeral=True)
-            return
-
-        session = self.session
-        gs = session.game_state
 
         if gs.game_over:
             await interaction.response.send_message("This game is already over.", ephemeral=True)
-            self.stop()
             return
 
-        self.disable_all_items()
-        self.stop()
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
 
-        await interaction.response.edit_message(content="🏳️ Forfeiting...", view=self)
-
-        # Deal 999 damage to the forfeiter — runs through normal loss logic
-        user_id = str(interaction.user.id)
         forfeiter = gs.player1 if user_id == gs.player1.user_id else gs.player2
         forfeiter.life = -999
 
@@ -582,19 +553,9 @@ class ForfeitConfirmView(discord.ui.View):
         result.game_over_messages = game_over_msgs
 
         try:
-            await post_turn_result(session, result)
+            await post_turn_result(self.session, result)
         except Exception as e:
-            print(f"[Forfeit] Error in post_turn_result: {e}")
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("This isn't your prompt!", ephemeral=True)
-            return
-
-        self.disable_all_items()
-        await interaction.response.edit_message(content="Forfeit cancelled.", view=self)
-        self.stop()
+            print(f"[Forfeit] Error: {e}")
 
 
 _TAUNT_CONFIG = {
@@ -1642,12 +1603,28 @@ async def forfeit_command(interaction: discord.Interaction):
         return
 
     session = get_session_for_user(user_id)
+    gs = session.game_state
 
-    # Show confirmation before forfeiting
-    confirm_view = ForfeitConfirmView(session, interaction.user.id)
-    await interaction.response.send_message(
-        "⚠️ **Are you sure you want to forfeit?** This will count as a loss.",
-        view=confirm_view, ephemeral=True)
+    if gs.game_over:
+        await interaction.response.send_message("This game is already over.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    forfeiter = gs.player1 if user_id == gs.player1.user_id else gs.player2
+    forfeiter.life = -999
+
+    result = TurnResult()
+    result.messages.append(f"🏳️ **{forfeiter.display_name}** forfeits!")
+    game_over_msgs = gs.check_game_over()
+    result.messages.extend(game_over_msgs)
+    result.game_over = gs.game_over
+    result.game_over_messages = game_over_msgs
+
+    try:
+        await post_turn_result(session, result)
+    except Exception as e:
+        print(f"[Forfeit slash] Error: {e}")
 
 
 @bot.tree.command(name="cardlist", description="View all available cards")
