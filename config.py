@@ -121,7 +121,7 @@ TOP_LIFE_BOX   = (1075, 62,  140, 38)
 TOP_SANITY_BOX = (1075, 152, 140, 38)
 
 # Avatar square (top-right, gold-bordered)
-TOP_AVATAR_BOX = (1265, 15, 210, 195)
+TOP_AVATAR_BOX = (1235, 22, 172, 162)
 
 # Display name (below / beside avatar)
 TOP_NAME_POS = (1270, 212)
@@ -176,7 +176,7 @@ BOTTOM_MADNESS_POS    = (330, 690)
 # --- BOTTOM PLAYER (p1 — initiator / main) ------------------------
 
 # Avatar square (bottom-left, gold-bordered)
-BOTTOM_AVATAR_BOX = (22, 770, 178, 178)
+BOTTOM_AVATAR_BOX = (87, 781, 172, 162)
 
 # Life / Sanity value boxes (to the right of the avatar)
 BOTTOM_LIFE_BOX   = (280, 795, 115, 38)
