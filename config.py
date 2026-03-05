@@ -109,11 +109,11 @@ BOARD_REF_H = 1024
 
 # 5 face-down card slots across the top row
 TOP_CARD_SLOTS = [
-    (97,  22, 172, 192),   # slot 1
-    (291, 22, 172, 192),   # slot 2
-    (486, 22, 172, 192),   # slot 3
-    (680, 22, 172, 192),   # slot 4
-    (875, 22, 172, 192),   # slot 5
+    (99,  24, 172, 192),   # slot 1
+    (296, 24, 172, 192),   # slot 2
+    (491, 24, 172, 192),   # slot 3
+    (685, 24, 172, 192),   # slot 4
+    (880, 24, 172, 192),   # slot 5
 ]
 
 # Life / Sanity value boxes (text goes centred inside these)
@@ -142,7 +142,7 @@ TOP_MADNESS_POS    = (330, 268)
 
 # Book (closed) sits in the right half of the centre raised box
 BOOK_CLOSED_POS  = (830, 420)
-BOOK_CLOSED_SIZE = (80, 130)
+BOOK_CLOSED_SIZE = (80, 160)
 
 # Book (open) is centred in the raised box during card resolution
 BOOK_OPEN_POS  = (680, 400)
@@ -187,11 +187,11 @@ BOTTOM_NAME_POS = (30, 952)
 
 # 5 face-down card slots across the bottom row
 BOTTOM_CARD_SLOTS = [
-    (418,  762, 186, 230),   # slot 1
-    (614,  762, 186, 230),   # slot 2
-    (810,  762, 186, 230),   # slot 3
-    (1006, 762, 186, 230),   # slot 4
-    (1202, 762, 186, 230),   # slot 5
+    (447,  782, 175, 210),   # slot 1
+    (647,  782, 175, 210),   # slot 2
+    (845,  782, 175, 210),   # slot 3
+    (1045, 782, 175, 210),   # slot 4
+    (1244, 782, 175, 210),   # slot 5
 ]
 
 # === Font Sizes (at reference 1536x1024; auto-scaled with board) ===
